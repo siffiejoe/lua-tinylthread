@@ -1,0 +1,3 @@
+[submodule "tinycthread"]
+	path = tinycthread
+	url = https://github.com/tinycthread/tinycthread.git
