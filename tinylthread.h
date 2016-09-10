@@ -25,37 +25,53 @@
 #endif
 
 
+/* metatable names */
+#define TLT_THRD_NAME  "tinylthread.thread"
+#define TLT_MTX_NAME   "tinylthread.mutex"
+#define TLT_PIPE_NAME  "tinylthread.pipe"
+
+/* other important keys in the registry */
+#define TLT_THISTHREAD "tinylthread.this"
+#define TLT_MAINFUNC   "tinylthread.main"
+
+
 /* common header for all objects/userdatas that may be shared over
- * multiple threads, and thus need reference counting
- */
+ * multiple threads, and thus need reference counting */
 typedef struct {
-  size_t refcnt;
-  mtx_t refcnt_mutex;
+  size_t cnt;
+  mtx_t mtx;
 } tinylheader;
 
 
 /* thread handle userdata type */
 typedef struct {
+  tinylheader ref;
   mtx_t thread_mutex;
   thrd_t thread;
   lua_State* L;
   char is_interrupted;
-  char is_joinable;
+  char is_detached;
   char is_dead;
 } tinylthread;
 
 
-/* mutex handle userdata type */
+/* shared part of the mutex handle */
 typedef struct {
   tinylheader ref;
   mtx_t mutex;
+} tinylmutex_shared;
+
+/* mutex handle userdata type */
+typedef struct {
+  tinylmutex_shared* m;
+  size_t lock_count;
 } tinylmutex;
 
 
-/* channel userdata type */
+/* pipe userdata type */
 typedef struct {
   tinylheader ref;
-  mtx_t channel_mutex;
+  mtx_t pipe_mutex;
   cnd_t can_read;
   cnd_t can_write;
   lua_State* L;
@@ -63,7 +79,7 @@ typedef struct {
   size_t readpos;
   size_t writepos;
   int lreferences[ 1 ]; /* variable length array! */
-} tinylchannel;
+} tinylpipe;
 
 
 #endif /* TINYLTHREAD_H_ */
