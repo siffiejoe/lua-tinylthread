@@ -130,15 +130,7 @@ static int tinylpipe_read( lua_State* L ) {
   return 0;
 }
 
-static int tinylpipe_tryread( lua_State* L ) {
-  return 0;
-}
-
 static int tinylpipe_write( lua_State* L ) {
-  return 0;
-}
-
-static int tinylpipe_trywrite( lua_State* L ) {
   return 0;
 }
 
@@ -187,9 +179,7 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
   };
   luaL_Reg const pipe_methods[] = {
     { "read", tinylpipe_read },
-    { "tryread", tinylpipe_tryread },
     { "write", tinylpipe_write },
-    { "trywrite", tinylipe_trywrite },
     { NULL, NULL }
   };
   luaL_Reg const pipe_metas[] = {
