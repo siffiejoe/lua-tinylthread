@@ -101,6 +101,26 @@ static tinylmutex* check_mutex( lua_State* L, int idx ) {
 
 
 
+static int detached_final_gc( lua_State* L ) {
+  tinylthread* thread = NULL;
+  int is_detached = 0;
+  lua_getfield( L, LUA_REGISTRYINDEX, TLT_THISTHREAD );
+  thread = lua_touserdata( L, -1 );
+  if( thread != NULL &&
+      thrd_success == mtx_lock( &(thread->t->thread_mutex) ) ) {
+    is_detached = thread->t->is_detached;
+    mtx_unlock( &(thread->t->thread_mutex) );
+  }
+  if( is_detached ) {
+    /* the Lua states of detached threads might never be collected,
+     * so we clean up as best as we can ... */
+    lua_gc( L, LUA_GCCOLLECT, 0 );
+    lua_gc( L, LUA_GCCOLLECT, 0 );
+  }
+  return 0;
+}
+
+
 static int mark_thread_dead( lua_State* L ) {
   int* status = lua_touserdata( L, 1 );
   tinylthread* thread = NULL;
@@ -119,6 +139,8 @@ static int mark_thread_dead( lua_State* L ) {
 static int tinylthread_thunk( void* arg ) {
   lua_State* L = arg;
   int status = lua_pcall( L, lua_gettop( L ), 0, 0 );
+  if( 0 != lua_cpcallr( L, detached_final_gc, NULL, 0 ) )
+    lua_pop( L, 1 ); /* pop error message if necessary */
   if( 0 != lua_cpcallr( L, mark_thread_dead, &status, 0 ) )
     lua_pop( L, 1 ); /* pop error message if necessary */
   return status != 0;
