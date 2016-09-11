@@ -8,24 +8,32 @@
 #endif
 
 
-/* helper functions for (un-)locking the mutex protecting the
- * reference count
- */
-static void lock_refcnt( lua_State* L, tinylheader* ref ) {
-  if( thrd_success != mtx_lock( ref->mtx ) )
+/* helper functions for managing the reference count of shared
+ * objects */
+static void incref( lua_State* L, tinylheader* ref ) {
+  if( thrd_success != mtx_lock( &(ref->mtx) ) )
     luaL_error( L, "mutex locking failed" );
-}
-
-static void unlock_refcnt( lua_State* L, tinylheader* ref ) {
-  if( thrd_success ! mtx_unlock( ref->mutex) )
+  ref->cnt++;
+  if( thrd_success != mtx_unlock( &(ref->mtx) ) )
     luaL_error( L, "mutex unlocking failed" );
 }
 
+static size_t decref( lua_State* L, tinylheader* ref ) {
+  size_t newcnt = 0;
+  if( thrd_success != mtx_lock( &(ref->mtx) ) )
+    luaL_error( L, "mutex locking failed" );
+  newcnt = --(ref->cnt);
+  if( thrd_success != mtx_unlock( &(ref->mtx) ) )
+    luaL_error( L, "mutex unlocking failed" );
+  return newcnt;
+}
+
 /* helper functions for accessing objects on the Lua stack */
-static tinylthread* check_thread( lua_State* L, int idx ) {
-  tinylmutex* ud = luaL_checkudata( L, idx, MUTEX_NAME );
+static tinylmutex* check_mutex( lua_State* L, int idx ) {
+  tinylmutex* ud = luaL_checkudata( L, idx, TLT_MTX_NAME );
   if( !ud->m )
     luaL_error( L, "trying to use invalid mutex" );
+  return ud;
 }
 
 
@@ -40,22 +48,22 @@ static int tinylthread_newmutex( lua_State* L ) {
   tinylmutex* ud = lua_newuserdata( L, sizeof( *ud ) );
   ud->m = NULL;
   ud->lock_count = 0;
-  luaL_setmetatable( L, MUTEX_NAME );
+  luaL_setmetatable( L, TLT_MTX_NAME );
   ud->m = malloc( sizeof( tinylmutex ) );
   if( !ud->m )
     luaL_error( L, "memory allocation error" );
-  if( thrd_success != mtx_init( &((*ud)->ref.mtx), mtx_plain ) ) {
+  if( thrd_success != mtx_init( &(ud->m->ref.mtx), mtx_plain ) ) {
     free( ud->m );
     ud->m = NULL;
     luaL_error( L, "mutex initialization failed" );
   }
-  if( thrd_success != mtx_init( &((*ud)->mutex), mtx_plain ) ) {
-    mtx_destroy( &((*ud)->ref.mtx) );
+  if( thrd_success != mtx_init( &(ud->m->mutex), mtx_plain ) ) {
+    mtx_destroy( &(ud->m->ref.mtx) );
     free( ud->m );
     ud->m = NULL;
     luaL_error( L, "mutex initialization failed" );
   }
-  (*ud)->ref.cnt = 1;
+  ud->m->ref.cnt = 1;
   return 1;
 }
 
@@ -63,15 +71,11 @@ static int tinylthread_newmutex( lua_State* L ) {
 static int tinylmutex_gc( lua_State* L ) {
   tinylmutex* ud = lua_touserdata( L, 1 );
   if( ud->m ) {
-    size_t refcnt = 0;
-    lock_refcnt( &(ud->m->ref) );
-    cnt = --(ud->m->ref.cnt);
-    unlock_refcnt( &(ud->m->ref) );
-    if( ud->lock_count )
+    if( ud->lock_count > 0 )
       mtx_unlock( &(ud->m->mutex) );
-    if( refcnt == 0 ) {
-      mtx_destroy( ud->m->ref.mtx );
-      mtx_destroy( ud->m->mutex );
+    if( 0 == decref( L, &(ud->m->ref) ) ) {
+      mtx_destroy( &(ud->m->ref.mtx) );
+      mtx_destroy( &(ud->m->mutex) );
       free( ud->m );
     }
     ud->m = NULL;
@@ -80,7 +84,7 @@ static int tinylmutex_gc( lua_State* L ) {
 }
 
 static int tinylmutex_lock( lua_State* L ) {
-  tinylmutex* ud = check_thread( L, 1 );
+  tinylmutex* ud = check_mutex( L, 1 );
   if( thrd_success != mtx_lock( &(ud->m->mutex) ) )
     luaL_error( L, "mutex locking failed" );
   ud->lock_count++;
@@ -88,7 +92,7 @@ static int tinylmutex_lock( lua_State* L ) {
 }
 
 static int tinylmutex_trylock( lua_State* L ) {
-  tinylmutex* ud = check_thread( L, 1 );
+  tinylmutex* ud = check_mutex( L, 1 );
   int success = 0;
   switch( mtx_trylock( &(ud->m->mutex) ) ) {
     case thrd_success:
@@ -106,10 +110,10 @@ static int tinylmutex_trylock( lua_State* L ) {
 }
 
 static int tinylmutex_unlock( lua_State* L ) {
-  tinylmutex* ud = check_thread( L, 1 );
+  tinylmutex* ud = check_mutex( L, 1 );
   if( ud->lock_count == 0 )
     luaL_error( L, "trying to unlock non-locked mutex" );
-  if( thrd_success ! mtx_unlock( &(ud->m->mutex) ) )
+  if( thrd_success != mtx_unlock( &(ud->m->mutex) ) )
     luaL_error( L, "mutex unlocking failed" );
   ud->lock_count--;
   return 0;
@@ -143,7 +147,12 @@ static void create_meta( lua_State* L, char const* name,
     luaL_error( L, "%s metatable already exists", name );
   lua_pushliteral( L, "locked" );
   lua_setfield( L, -2, "__metatable" );
-  luaL_newlib( L, methods );
+  lua_newtable( L );
+#if LUA_VERSION_NUM > 501
+  luaL_setfuncs( L, methods, 0 );
+#else
+  luaL_register( L, NULL, methods );
+#endif
   lua_setfield( L, -2, "__index" );
 #if LUA_VERSION_NUM > 501
   luaL_setfuncs( L, metas, 0 );
