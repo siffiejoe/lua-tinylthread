@@ -265,6 +265,7 @@ static int get_error_message( lua_State* L ) {
 static int tinylthread_newthread( lua_State* L ) {
   tinylthread* ud = NULL;
   thrd_start_t thunk = 0;
+  lua_State* tempL = NULL;
   luaL_checkstring( L, 1 ); /* the Lua code */
   ud = lua_newuserdata( L, sizeof( *ud ) );
   ud->t = NULL;
@@ -300,6 +301,7 @@ static int tinylthread_newthread( lua_State* L ) {
     luaL_error( L, "mutex initialization failed" );
   }
   ud->t->L = luaL_newstate();
+  tempL = ud->t->L;
   if( !ud->t->L ) {
     mtx_destroy( &(ud->t->ref.mtx) );
     mtx_destroy( &(ud->t->thread_mutex) );
@@ -310,11 +312,8 @@ static int tinylthread_newthread( lua_State* L ) {
   /* prepare the Lua state for the child thread */
   if( 0 != lua_cpcallr( ud->t->L, prepare_thread_state, L, LUA_MULTRET ) ) {
     lua_cpcallr( L, get_error_message, ud->t->L, 0 );
-    lua_close( ud->t->L );
-    mtx_destroy( &(ud->t->ref.mtx) );
-    mtx_destroy( &(ud->t->thread_mutex) );
-    free( ud->t );
-    ud->t = NULL;
+    ud->t->L = NULL;
+    lua_close( tempL );
     lua_error( L ); /* rethrow the error from `get_error_message`  */
   }
   /* get thread main function from the child's registry (must not
@@ -324,20 +323,14 @@ static int tinylthread_newthread( lua_State* L ) {
   lua_pop( ud->t->L, 1 );
   /* lock this structure and create a C thread */
   if( thrd_success != mtx_lock( &(ud->t->thread_mutex) ) ) {
-    lua_close( ud->t->L );
-    mtx_destroy( &(ud->t->ref.mtx) );
-    mtx_destroy( &(ud->t->thread_mutex) );
-    free( ud->t );
-    ud->t = NULL;
+    ud->t->L = NULL;
+    lua_close( tempL );
     luaL_error( L, "mutex locking failed" );
   }
   if( thrd_success != thrd_create( &(ud->t->thread), thunk, ud->t->L ) ) {
     mtx_unlock( &(ud->t->thread_mutex) );
-    lua_close( ud->t->L );
-    mtx_destroy( &(ud->t->ref.mtx) );
-    mtx_destroy( &(ud->t->thread_mutex) );
-    free( ud->t );
-    ud->t = NULL;
+    ud->t->L = NULL;
+    lua_close( tempL );
     luaL_error( L, "thread spawning failed" );
   }
   ud->t->is_dead = 0;
