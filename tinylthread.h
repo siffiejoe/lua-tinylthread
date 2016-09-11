@@ -89,7 +89,7 @@ typedef struct {
 
 /* function pointer for copying certain userdata values to the Lua
  * states of other threads */
-typedef void (*tinylpipe_copyf)( void* ud, lua_State* L, int midx );
+typedef int (*tinylpipe_copyf)( void* ud, lua_State* L, int midx );
 
 
 #endif /* TINYLTHREAD_H_ */

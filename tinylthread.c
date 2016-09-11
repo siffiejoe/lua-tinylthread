@@ -2,7 +2,12 @@
 #include "tinylthread.h"
 
 
-/* compatibility for Lua 5.1 and 5.2 */
+/* compatibility for older Lua versions */
+#if LUA_VERSION_NUM <= 501
+#  define luaL_setmetatable( L, tn ) \
+  (luaL_getmetatable( L, tn ), lua_setmetatable( L, -2 ))
+#endif
+
 #if LUA_VERSION_NUM <= 502
 static int lua_isinteger( lua_State* L, int idx ) {
   if( lua_type( L, idx ) == LUA_TNUMBER ) {
@@ -32,7 +37,7 @@ static int lua_cpcallr_helper( lua_State* L ) {
 }
 
 static int lua_cpcallr( lua_State* L, lua_CFunction f, void* u, int ret ) {
-  static char xyz[ 1 ] = { 0 }; /* used for its pointer value */
+  char xyz[ 1 ] = { 0 }; /* only used for its pointer value */
   lua_cpcallr_data data = { xyz, f };
   int status = 0;
   if( ret == 0 )
@@ -63,8 +68,10 @@ static void incref( lua_State* L, tinylheader* ref ) {
   if( thrd_success != mtx_lock( &(ref->mtx) ) )
     luaL_error( L, "mutex locking failed" );
   ref->cnt++;
-  if( thrd_success != mtx_unlock( &(ref->mtx) ) )
+  if( thrd_success != mtx_unlock( &(ref->mtx) ) ) {
+    ref->cnt--;
     luaL_error( L, "mutex unlocking failed" );
+  }
 }
 
 static size_t decref( lua_State* L, tinylheader* ref ) {
@@ -99,7 +106,8 @@ static int mark_thread_dead( lua_State* L ) {
   tinylthread* thread = NULL;
   lua_getfield( L, LUA_REGISTRYINDEX, TLT_THISTHREAD );
   thread = lua_touserdata( L, -1 );
-  if( thrd_success == mtx_lock( &(thread->t->thread_mutex) ) ) {
+  if( thread != NULL &&
+      thrd_success == mtx_lock( &(thread->t->thread_mutex) ) ) {
     thread->t->exit_status = *status;
     thread->t->is_dead = 1;
     mtx_unlock( &(thread->t->thread_mutex) );
@@ -112,7 +120,7 @@ static int tinylthread_thunk( void* arg ) {
   lua_State* L = arg;
   int status = lua_pcall( L, lua_gettop( L ), 0, 0 );
   if( 0 != lua_cpcallr( L, mark_thread_dead, &status, 0 ) )
-    lua_pop( L, 1 );
+    lua_pop( L, 1 ); /* pop error message if necessary */
   return status != 0;
 }
 
@@ -169,11 +177,12 @@ static void copy_to_thread( lua_State* toL, lua_State* fromL ) {
               lua_rawget( toL, LUA_REGISTRYINDEX );
               if( lua_istable( toL, -1 ) ) {
                 int top = lua_gettop( toL );
-                copyf( lua_touserdata( fromL, i ), toL, top );
-                lua_insert( toL, top );
-                lua_settop( toL, top );
-                lua_pop( fromL, 2 ); /* pop metatable and name */
-                break; /* success! */
+                if( copyf( lua_touserdata( fromL, i ), toL, top ) ) {
+                  lua_insert( toL, top );
+                  lua_settop( toL, top );
+                  lua_pop( fromL, 2 ); /* pop metatable and name */
+                  break; /* success! */
+                }
               }
             }
           }
@@ -294,6 +303,7 @@ static int tinylthread_newthread( lua_State* L ) {
   if( !ud->t->L ) {
     mtx_destroy( &(ud->t->ref.mtx) );
     mtx_destroy( &(ud->t->thread_mutex) );
+    free( ud->t );
     ud->t = NULL;
     luaL_error( L, "memory allocation error" );
   }
@@ -303,6 +313,7 @@ static int tinylthread_newthread( lua_State* L ) {
     lua_close( ud->t->L );
     mtx_destroy( &(ud->t->ref.mtx) );
     mtx_destroy( &(ud->t->thread_mutex) );
+    free( ud->t );
     ud->t = NULL;
     lua_error( L ); /* rethrow the error from `get_error_message`  */
   }
@@ -316,6 +327,7 @@ static int tinylthread_newthread( lua_State* L ) {
     lua_close( ud->t->L );
     mtx_destroy( &(ud->t->ref.mtx) );
     mtx_destroy( &(ud->t->thread_mutex) );
+    free( ud->t );
     ud->t = NULL;
     luaL_error( L, "mutex locking failed" );
   }
@@ -324,12 +336,80 @@ static int tinylthread_newthread( lua_State* L ) {
     lua_close( ud->t->L );
     mtx_destroy( &(ud->t->ref.mtx) );
     mtx_destroy( &(ud->t->thread_mutex) );
+    free( ud->t );
     ud->t = NULL;
     luaL_error( L, "thread spawning failed" );
   }
   ud->t->is_dead = 0;
   mtx_unlock( &(ud->t->thread_mutex) );
   return 1;
+}
+
+
+static int tinylthread_copy( void* p, lua_State* L, int midx ) {
+  tinylthread* ud = p;
+  tinylthread* copy = lua_newuserdata( L, sizeof( *copy ) );
+  copy->t = NULL;
+  copy->is_parent = 0;
+  lua_pushvalue( L, midx );
+  lua_setmetatable( L, -2 );
+  if( ud->t ) {
+    incref( L, &(ud->t->ref) );
+    copy->t = ud->t;
+  }
+  return 1;
+}
+
+
+static int tinylthread_gc( lua_State* L ) {
+  tinylthread* ud = lua_touserdata( L, 1 );
+  if( ud->t ) {
+    int raise_error = 0;
+    int is_dead = 0;
+    if( ud->is_parent ) {
+      if( thrd_success == mtx_lock( &(ud->t->thread_mutex) ) ) {
+        raise_error = !ud->t->is_detached && ud->t->L;
+        is_dead = ud->t->is_dead;
+        mtx_unlock( &(ud->t->thread_mutex) );
+      }
+    }
+    switch( decref( L, &(ud->t->ref) ) ) {
+      case 1:
+        if( ud->is_parent && is_dead && ud->t->L ) {
+          lua_State* tempL = ud->t->L;
+          ud->t->L = NULL;
+          lua_close( tempL );
+        }
+        break;
+      case 0:
+        mtx_destroy( &(ud->t->ref.mtx) );
+        mtx_destroy( &(ud->t->thread_mutex) );
+        free( ud->t );
+        ud->t = NULL;
+        break;
+    }
+    if( raise_error )
+      luaL_error( L, "collecting non-joined thread" );
+  }
+  return 0;
+}
+
+
+static int tinylthread_detach( lua_State* L ) {
+  tinylthread* ud = check_thread( L, 1 );
+  if( !ud->is_parent )
+    luaL_error( L, "detach request from unrelated thread" );
+  /* TODO */
+  return 0;
+}
+
+
+static int tinylthread_join( lua_State* L ) {
+  tinylthread* ud = check_thread( L, 1 );
+  if( !ud->is_parent )
+    luaL_error( L, "join request from unrelated thread" );
+  /* TODO */
+  return 0;
 }
 
 
@@ -353,6 +433,21 @@ static int tinylthread_newmutex( lua_State* L ) {
     free( ud->m );
     ud->m = NULL;
     luaL_error( L, "mutex initialization failed" );
+  }
+  return 1;
+}
+
+
+static int tinylmutex_copy( void* p, lua_State* L, int midx ) {
+  tinylmutex* ud = p;
+  tinylmutex* copy = lua_newuserdata( L, sizeof( *copy ) );
+  copy->m = NULL;
+  copy->lock_count = 0;
+  lua_pushvalue( L, midx );
+  lua_setmetatable( L, -2 );
+  if( ud->m ) {
+    incref( L, &(ud->m->ref) );
+    copy->m = ud->m;
   }
   return 1;
 }
@@ -418,6 +513,10 @@ static int tinylthread_newpipe( lua_State* L ) {
   return 0;
 }
 
+static int tinylpipe_copy( void* p, lua_State* L, int midx ) {
+  return 0;
+}
+
 static int tinylpipe_gc( lua_State* L ) {
 
   return 0;
@@ -438,19 +537,23 @@ static void create_meta( lua_State* L, char const* name,
                          luaL_Reg const* metas ) {
   if( !luaL_newmetatable( L, name ) )
     luaL_error( L, "%s metatable already exists", name );
+#if LUA_VERSION_NUM < 503
+  lua_pushstring( L, name );
+  lua_setfield( L, -2, "__name" );
+#endif
   lua_pushliteral( L, "locked" );
   lua_setfield( L, -2, "__metatable" );
   lua_newtable( L );
-#if LUA_VERSION_NUM > 501
-  luaL_setfuncs( L, methods, 0 );
-#else
+#if LUA_VERSION_NUM < 502
   luaL_register( L, NULL, methods );
+#else
+  luaL_setfuncs( L, methods, 0 );
 #endif
   lua_setfield( L, -2, "__index" );
-#if LUA_VERSION_NUM > 501
-  luaL_setfuncs( L, metas, 0 );
-#else
+#if LUA_VERSION_NUM < 502
   luaL_register( L, NULL, metas );
+#else
+  luaL_setfuncs( L, metas, 0 );
 #endif
   lua_pop( L, 1 );
 }
@@ -464,9 +567,13 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
     { NULL, NULL }
   };
   luaL_Reg const thread_methods[] = {
+    { "detach", tinylthread_detach },
+    { "join", tinylthread_join },
     { NULL, NULL }
   };
   luaL_Reg const thread_metas[] = {
+    { "__gc", tinylthread_gc },
+    { "__tinylthread@pipe", (lua_CFunction)tinylthread_copy },
     { NULL, NULL }
   };
   luaL_Reg const mutex_methods[] = {
@@ -477,6 +584,7 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
   };
   luaL_Reg const mutex_metas[] = {
     { "__gc", tinylmutex_gc },
+    { "__tinylthread@pipe", (lua_CFunction)tinylmutex_copy },
     { NULL, NULL }
   };
   luaL_Reg const rpipe_methods[] = {
@@ -489,6 +597,7 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
   };
   luaL_Reg const pipe_metas[] = {
     { "__gc", tinylpipe_gc },
+    { "__tinylthread@pipe", (lua_CFunction)tinylpipe_copy },
     { NULL, NULL }
   };
   create_meta( L, TLT_THRD_NAME, thread_methods, thread_metas );
