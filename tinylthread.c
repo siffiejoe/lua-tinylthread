@@ -428,6 +428,45 @@ static int tinylthread_join( lua_State* L ) {
 }
 
 
+static int tinylthread_isdead( lua_State* L ) {
+  tinylthread* ud = check_thread( L, 1 );
+  int v = 0;
+  if( thrd_success != mtx_lock( &(ud->t->thread_mutex) ) )
+    luaL_error( L, "mutex locking failed" );
+  v = ud->t->is_dead;
+  if( thrd_success != mtx_unlock( &(ud->t->thread_mutex) ) )
+    luaL_error( L, "mutex unlocking failed" );
+  lua_pushboolean( L, v );
+  return 1;
+}
+
+
+static int tinylthread_isdetached( lua_State* L ) {
+  tinylthread* ud = check_thread( L, 1 );
+  int v = 0;
+  if( thrd_success != mtx_lock( &(ud->t->thread_mutex) ) )
+    luaL_error( L, "mutex locking failed" );
+  v = ud->t->is_detached;
+  if( thrd_success != mtx_unlock( &(ud->t->thread_mutex) ) )
+    luaL_error( L, "mutex unlocking failed" );
+  lua_pushboolean( L, v );
+  return 1;
+}
+
+
+static int tinylthread_isinterrupted( lua_State* L ) {
+  tinylthread* ud = check_thread( L, 1 );
+  int v = 0;
+  if( thrd_success != mtx_lock( &(ud->t->thread_mutex) ) )
+    luaL_error( L, "mutex locking failed" );
+  v = ud->t->is_interrupted;
+  if( thrd_success != mtx_unlock( &(ud->t->thread_mutex) ) )
+    luaL_error( L, "mutex unlocking failed" );
+  lua_pushboolean( L, v );
+  return 1;
+}
+
+
 
 static int tinylthread_newmutex( lua_State* L ) {
   tinylmutex* ud = lua_newuserdata( L, sizeof( *ud ) );
@@ -584,6 +623,9 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
   luaL_Reg const thread_methods[] = {
     { "detach", tinylthread_detach },
     { "join", tinylthread_join },
+    { "isdead", tinylthread_isdead },
+    { "isdetached", tinylthread_isdetached },
+    { "isinterrupted", tinylthread_isinterrupted },
     { NULL, NULL }
   };
   luaL_Reg const thread_metas[] = {
