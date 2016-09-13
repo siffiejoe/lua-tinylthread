@@ -26,14 +26,16 @@
 
 
 /* metatable names */
-#define TLT_THRD_NAME  "tinylthread.thread"
-#define TLT_MTX_NAME   "tinylthread.mutex"
-#define TLT_RPIPE_NAME "tinylthread.pipe.in"
-#define TLT_WPIPE_NAME "tinylthread.pipe.out"
+#define TLT_THRD_NAME   "tinylthread.thread"
+#define TLT_MTX_NAME    "tinylthread.mutex"
+#define TLT_RPIPE_NAME  "tinylthread.pipe.in"
+#define TLT_WPIPE_NAME  "tinylthread.pipe.out"
+#define TLT_ITR_NAME    "tinylthread.interrupt"
 
 /* other important keys in the registry */
-#define TLT_THISTHREAD "tinylthread.this"
-#define TLT_THUNK      "tinylthread.thunk"
+#define TLT_THISTHREAD  "tinylthread.this"
+#define TLT_THUNK       "tinylthread.thunk"
+#define TLT_INTERRUPTED "tinylthread.interrupt.err"
 
 
 /* common header for all objects/userdatas that may be shared over

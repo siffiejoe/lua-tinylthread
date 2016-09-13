@@ -428,6 +428,17 @@ static int tinylthread_join( lua_State* L ) {
 }
 
 
+static int tinylthread_interrupt( lua_State* L ) {
+  tinylthread* ud = check_thread( L, 1 );
+  if( thrd_success == mtx_lock( &(ud->t->thread_mutex) ) )
+    luaL_error( L, "mutex locking failed" );
+  ud->t->is_interrupted = 1;
+  if( thrd_success != mtx_unlock( &(ud->t->thread_mutex) ) )
+    luaL_error( L, "mutex unlocking failed" );
+  return 0;
+}
+
+
 static int tinylthread_isdead( lua_State* L ) {
   tinylthread* ud = check_thread( L, 1 );
   int v = 0;
@@ -447,19 +458,6 @@ static int tinylthread_isdetached( lua_State* L ) {
   if( thrd_success != mtx_lock( &(ud->t->thread_mutex) ) )
     luaL_error( L, "mutex locking failed" );
   v = ud->t->is_detached;
-  if( thrd_success != mtx_unlock( &(ud->t->thread_mutex) ) )
-    luaL_error( L, "mutex unlocking failed" );
-  lua_pushboolean( L, v );
-  return 1;
-}
-
-
-static int tinylthread_isinterrupted( lua_State* L ) {
-  tinylthread* ud = check_thread( L, 1 );
-  int v = 0;
-  if( thrd_success != mtx_lock( &(ud->t->thread_mutex) ) )
-    luaL_error( L, "mutex locking failed" );
-  v = ud->t->is_interrupted;
   if( thrd_success != mtx_unlock( &(ud->t->thread_mutex) ) )
     luaL_error( L, "mutex unlocking failed" );
   lua_pushboolean( L, v );
@@ -564,23 +562,58 @@ static int tinylmutex_unlock( lua_State* L ) {
 
 
 static int tinylthread_newpipe( lua_State* L ) {
+  /* TODO */
   return 0;
 }
 
 static int tinylpipe_copy( void* p, lua_State* L, int midx ) {
+  /* TODO */
   return 0;
 }
 
 static int tinylpipe_gc( lua_State* L ) {
-
+  /* TODO */
   return 0;
 }
 
 static int tinylpipe_read( lua_State* L ) {
+  /* TODO */
   return 0;
 }
 
 static int tinylpipe_write( lua_State* L ) {
+  /* TODO */
+  return 0;
+}
+
+
+
+static int tinylitr_tostring( lua_State* L ) {
+  lua_pushliteral( L, "interrupted thread" );
+  return 1;
+}
+
+
+static int tinylitr_copy( void* p, lua_State* L, int midx ) {
+  (void)p;
+  (void)midx;
+  lua_getfield( L, LUA_REGISTRYINDEX, TLT_INTERRUPTED );
+  if( lua_type( L, -1 ) != LUA_TUSERDATA ) {
+    lua_pop( L, 1 );
+    return 0;
+  }
+  return 1;
+}
+
+
+static int tinylthread_disable( lua_State* L ) {
+  /* TODO */
+  return 0;
+}
+
+
+static int tinylthread_check( lua_State* L ) {
+  /* TODO */
   return 0;
 }
 
@@ -597,18 +630,22 @@ static void create_meta( lua_State* L, char const* name,
 #endif
   lua_pushliteral( L, "locked" );
   lua_setfield( L, -2, "__metatable" );
-  lua_newtable( L );
+  if( methods ) {
+    lua_newtable( L );
 #if LUA_VERSION_NUM < 502
-  luaL_register( L, NULL, methods );
+    luaL_register( L, NULL, methods );
 #else
-  luaL_setfuncs( L, methods, 0 );
+    luaL_setfuncs( L, methods, 0 );
 #endif
-  lua_setfield( L, -2, "__index" );
+    lua_setfield( L, -2, "__index" );
+  }
+  if( metas ) {
 #if LUA_VERSION_NUM < 502
-  luaL_register( L, NULL, metas );
+    luaL_register( L, NULL, metas );
 #else
-  luaL_setfuncs( L, metas, 0 );
+    luaL_setfuncs( L, metas, 0 );
 #endif
+  }
   lua_pop( L, 1 );
 }
 
@@ -618,14 +655,16 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
     { "thread", tinylthread_newthread },
     { "mutex", tinylthread_newmutex },
     { "pipe", tinylthread_newpipe },
+    { "disableinterrupt", tinylthread_disable },
+    { "checkinterrupt", tinylthread_check },
     { NULL, NULL }
   };
   luaL_Reg const thread_methods[] = {
     { "detach", tinylthread_detach },
     { "join", tinylthread_join },
+    { "interrupt", tinylthread_interrupt },
     { "isdead", tinylthread_isdead },
     { "isdetached", tinylthread_isdetached },
-    { "isinterrupted", tinylthread_isinterrupted },
     { NULL, NULL }
   };
   luaL_Reg const thread_metas[] = {
@@ -657,12 +696,21 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
     { "__tinylthread@pipe", (lua_CFunction)tinylpipe_copy },
     { NULL, NULL }
   };
+  luaL_Reg const itr_metas[] = {
+    { "__tostring", tinylitr_tostring },
+    { "__tinylthread@pipe", (lua_CFunction)tinylitr_copy },
+    { NULL, NULL }
+  };
   create_meta( L, TLT_THRD_NAME, thread_methods, thread_metas );
   create_meta( L, TLT_MTX_NAME, mutex_methods, mutex_metas );
   create_meta( L, TLT_RPIPE_NAME, rpipe_methods, pipe_metas );
   create_meta( L, TLT_WPIPE_NAME, wpipe_methods, pipe_metas );
+  create_meta( L, TLT_ITR_NAME, NULL, itr_metas );
   lua_pushcfunction( L, (lua_CFunction)tinylthread_thunk );
   lua_setfield( L, LUA_REGISTRYINDEX, TLT_THUNK );
+  lua_newuserdata( L, 0 );
+  luaL_setmetatable( L, TLT_ITR_NAME );
+  lua_setfield( L, LUA_REGISTRYINDEX, TLT_INTERRUPTED );
 #if LUA_VERSION_NUM == 501
   lua_newtable( L );
   luaL_register( L, NULL, functions );
