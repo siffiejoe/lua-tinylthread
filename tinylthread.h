@@ -28,8 +28,8 @@
 /* metatable names */
 #define TLT_THRD_NAME   "tinylthread.thread"
 #define TLT_MTX_NAME    "tinylthread.mutex"
-#define TLT_RPIPE_NAME  "tinylthread.pipe.in"
-#define TLT_WPIPE_NAME  "tinylthread.pipe.out"
+#define TLT_RPORT_NAME  "tinylthread.port.in"
+#define TLT_WPORT_NAME  "tinylthread.port.out"
 #define TLT_ITR_NAME    "tinylthread.interrupt"
 
 /* other important keys in the registry */
@@ -77,16 +77,16 @@ typedef struct {
 } tinylmutex;
 
 
-/* pipe userdata type */
+/* port userdata type */
 typedef struct {
   tinylheader ref;
-  mtx_t pipe_mutex;
+  mtx_t port_mutex;
   cnd_t data_available;
   cnd_t write_finished;
   lua_State* L;
   size_t readers;
   size_t writers;
-} tinylpipe;
+} tinylport;
 
 
 /* function pointer for copying certain userdata values to the Lua

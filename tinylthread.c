@@ -566,22 +566,22 @@ static int tinylthread_newpipe( lua_State* L ) {
   return 0;
 }
 
-static int tinylpipe_copy( void* p, lua_State* L, int midx ) {
+static int tinylport_copy( void* p, lua_State* L, int midx ) {
   /* TODO */
   return 0;
 }
 
-static int tinylpipe_gc( lua_State* L ) {
+static int tinylport_gc( lua_State* L ) {
   /* TODO */
   return 0;
 }
 
-static int tinylpipe_read( lua_State* L ) {
+static int tinylport_read( lua_State* L ) {
   /* TODO */
   return 0;
 }
 
-static int tinylpipe_write( lua_State* L ) {
+static int tinylport_write( lua_State* L ) {
   /* TODO */
   return 0;
 }
@@ -683,17 +683,17 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
     { "__tinylthread@pipe", (lua_CFunction)tinylmutex_copy },
     { NULL, NULL }
   };
-  luaL_Reg const rpipe_methods[] = {
-    { "read", tinylpipe_read },
+  luaL_Reg const rport_methods[] = {
+    { "read", tinylport_read },
     { NULL, NULL }
   };
-  luaL_Reg const wpipe_methods[] = {
-    { "write", tinylpipe_write },
+  luaL_Reg const wport_methods[] = {
+    { "write", tinylport_write },
     { NULL, NULL }
   };
-  luaL_Reg const pipe_metas[] = {
-    { "__gc", tinylpipe_gc },
-    { "__tinylthread@pipe", (lua_CFunction)tinylpipe_copy },
+  luaL_Reg const port_metas[] = {
+    { "__gc", tinylport_gc },
+    { "__tinylthread@pipe", (lua_CFunction)tinylport_copy },
     { NULL, NULL }
   };
   luaL_Reg const itr_metas[] = {
@@ -703,8 +703,8 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
   };
   create_meta( L, TLT_THRD_NAME, thread_methods, thread_metas );
   create_meta( L, TLT_MTX_NAME, mutex_methods, mutex_metas );
-  create_meta( L, TLT_RPIPE_NAME, rpipe_methods, pipe_metas );
-  create_meta( L, TLT_WPIPE_NAME, wpipe_methods, pipe_metas );
+  create_meta( L, TLT_RPORT_NAME, rport_methods, port_metas );
+  create_meta( L, TLT_WPORT_NAME, wport_methods, port_metas );
   create_meta( L, TLT_ITR_NAME, NULL, itr_metas );
   lua_pushcfunction( L, (lua_CFunction)tinylthread_thunk );
   lua_setfield( L, LUA_REGISTRYINDEX, TLT_THUNK );
