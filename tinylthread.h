@@ -36,6 +36,7 @@
 #define TLT_THISTHREAD  "tinylthread.this"
 #define TLT_THUNK       "tinylthread.thunk"
 #define TLT_INTERRUPTED "tinylthread.interrupt.err"
+#define TLT_C_API_V1    "tinylthread.c.api.v1"
 
 
 /* common header for all objects/userdatas that may be shared over
@@ -87,6 +88,16 @@ typedef struct {
   size_t readers;
   size_t writers;
 } tinylport;
+
+
+/* a C API for other extension modules */
+typedef struct {
+  unsigned version;
+
+} tinylthread_c_api_v1;
+
+/* minor version of the v1 C API */
+#define TLT_C_API_V1_MINOR  0
 
 
 /* function pointer for copying certain userdata values to the Lua

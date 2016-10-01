@@ -619,6 +619,13 @@ static int tinylthread_check( lua_State* L ) {
 
 
 
+static void create_api( lua_State* L ) {
+  tinylthread_c_api_v1* api = lua_newuserdata( L, sizeof( *api ) );
+  api->version = TLT_C_API_V1_MINOR;
+  lua_setfield( L, LUA_REGISTRYINDEX, TLT_C_API_V1 );
+}
+
+
 static void create_meta( lua_State* L, char const* name,
                          luaL_Reg const* methods,
                          luaL_Reg const* metas ) {
@@ -701,13 +708,19 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
     { "__tinylthread@pipe", (lua_CFunction)tinylitr_copy },
     { NULL, NULL }
   };
+  /* create a struct containing function pointers to functions useful
+   * for other C extension modules and put it in the registry */
+  create_api( L );
+  /* create and register all metatables used by this module */
   create_meta( L, TLT_THRD_NAME, thread_methods, thread_metas );
   create_meta( L, TLT_MTX_NAME, mutex_methods, mutex_metas );
   create_meta( L, TLT_RPORT_NAME, rport_methods, port_metas );
   create_meta( L, TLT_WPORT_NAME, wport_methods, port_metas );
   create_meta( L, TLT_ITR_NAME, NULL, itr_metas );
+  /* store the common thread main function in the registry */
   lua_pushcfunction( L, (lua_CFunction)tinylthread_thunk );
   lua_setfield( L, LUA_REGISTRYINDEX, TLT_THUNK );
+  /* create a sentinel value and store it in the registry */
   lua_newuserdata( L, 0 );
   luaL_setmetatable( L, TLT_ITR_NAME );
   lua_setfield( L, LUA_REGISTRYINDEX, TLT_INTERRUPTED );
