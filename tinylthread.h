@@ -11,6 +11,7 @@
     __STDC_VERSION__ >= 201112L && \
     !defined( __STDC_NO_THREADS__ ) /* use C11 threads */
 #  include <threads.h>
+#  include <time.h>
 #else /* use C11 threads emulation tinycthreads */
 #  include <tinycthread.h>
 #endif
@@ -51,12 +52,13 @@ typedef struct {
 typedef struct {
   tinylheader ref;
   thrd_t thread;
-  mtx_t thread_mutex;
-  lua_State* L;
-  int exit_status;
-  char is_interrupted;
+  mtx_t mutex;
+  cnd_t* condition;  /* non-NULL if thread is waiting */
+  lua_State* L;  /* as long as it lives only the child may access L */
+  int  exit_status;
   char is_detached;
-  char is_dead;
+  char is_interrupted;
+  char ignore_interrupt;
 } tinylthread_shared;
 
 typedef struct {
@@ -69,25 +71,53 @@ typedef struct {
 typedef struct {
   tinylheader ref;
   mtx_t mutex;
+  cnd_t unlocked;
+  size_t count;
 } tinylmutex_shared;
 
 /* mutex handle userdata type */
 typedef struct {
   tinylmutex_shared* m;
-  size_t lock_count;
+  char is_owner;
 } tinylmutex;
 
 
-/* port userdata type */
+/* shared part of port userdata type
+ *
+ * receiver:
+ * - lock the mutex
+ * - while L != NULL and wports > 0 wait on waiting_receivers
+ * - raise error if wports == 0 or interrupted
+ * - set L and signal waiting_senders
+ * - wait on data_copied
+ * - set L to NULL
+ * - signal waiting_receivers
+ * - raise error if (wports == 0 and no value) or interrupted
+ *
+ * sender:
+ * - lock the mutex
+ * - while L == NULL and rports > 0 wait on waiting_senders
+ * - raise error if rports == 0 or interrupted
+ * - copy value to L
+ * - signal data_copied
+ */
 typedef struct {
   tinylheader ref;
-  mtx_t port_mutex;
-  cnd_t data_available;
-  cnd_t write_finished;
-  lua_State* L;
-  size_t readers;
-  size_t writers;
+  mtx_t mutex;
+  cnd_t data_copied;
+  cnd_t waiting_senders;
+  cnd_t waiting_receivers;
+  lua_State* L;  /* L of current receiver */
+  size_t rports;
+  size_t wports;
+} tinylport_shared;
+
+/* port userdata type */
+typedef struct {
+  tinylport_shared* p;
+  char is_reader;
 } tinylport;
+
 
 
 /* a C API for other extension modules */
@@ -102,7 +132,7 @@ typedef struct {
 
 /* function pointer for copying certain userdata values to the Lua
  * states of other threads */
-typedef int (*tinylpipe_copyf)( void* ud, lua_State* L, int midx );
+typedef int (*tinylport_copyf)( void* ud, lua_State* L, int midx );
 
 
 #endif /* TINYLTHREAD_H_ */

@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <math.h>
 #include "tinylthread.h"
 
 
@@ -61,12 +62,27 @@ static int lua_cpcallr( lua_State* L, lua_CFunction f, void* u, int ret ) {
 #endif
 
 
+static void* getudatafromregistry( lua_State* L, char const* name ) {
+  lua_getfield( L, LUA_REGISTRYINDEX, name );
+  return lua_touserdata( L, -1 );
+}
+
+/* in many circumstance failure to (un-)lock a mutex should be fatal
+ * (i.e. raise a Lua error). */
+static void mtx_lock_or_die( lua_State* L, mtx_t* m ) {
+  if( thrd_success != mtx_lock( m ) )
+    luaL_error( L, "mutex locking failed" );
+}
+
+static void mtx_unlock_or_die( lua_State* L, mtx_t* m ) {
+  if( thrd_success != mtx_unlock( m ) )
+    luaL_error( L, "mutex unlocking failed" );
+}
 
 /* helper functions for managing the reference count of shared
  * objects */
 static void incref( lua_State* L, tinylheader* ref ) {
-  if( thrd_success != mtx_lock( &(ref->mtx) ) )
-    luaL_error( L, "mutex locking failed" );
+  mtx_lock_or_die( L, &(ref->mtx) );
   ref->cnt++;
   if( thrd_success != mtx_unlock( &(ref->mtx) ) ) {
     ref->cnt--;
@@ -76,11 +92,9 @@ static void incref( lua_State* L, tinylheader* ref ) {
 
 static size_t decref( lua_State* L, tinylheader* ref ) {
   size_t newcnt = 0;
-  if( thrd_success != mtx_lock( &(ref->mtx) ) )
-    luaL_error( L, "mutex locking failed" );
+  mtx_lock_or_die( L, &(ref->mtx) );
   newcnt = --(ref->cnt);
-  if( thrd_success != mtx_unlock( &(ref->mtx) ) )
-    luaL_error( L, "mutex unlocking failed" );
+  mtx_unlock_or_die( L, &(ref->mtx) );
   return newcnt;
 }
 
@@ -88,49 +102,85 @@ static size_t decref( lua_State* L, tinylheader* ref ) {
 static tinylthread* check_thread( lua_State* L, int idx ) {
   tinylthread* ud = luaL_checkudata( L, idx, TLT_THRD_NAME );
   if( !ud->t )
-    luaL_error( L, "trying to use invalid thread" );
+    luaL_error( L, "attempt to use invalid thread" );
   return ud;
 }
 
 static tinylmutex* check_mutex( lua_State* L, int idx ) {
   tinylmutex* ud = luaL_checkudata( L, idx, TLT_MTX_NAME );
   if( !ud->m )
-    luaL_error( L, "trying to use invalid mutex" );
+    luaL_error( L, "attempt to use invalid mutex" );
+  return ud;
+}
+
+static tinylport* check_rport( lua_State* L, int idx ) {
+  tinylport* ud = luaL_checkudata( L, idx, TLT_RPORT_NAME );
+  if( !ud->p )
+    luaL_error( L, "attempt to use invalid port" );
+  return ud;
+}
+
+static tinylport* check_wport( lua_State* L, int idx ) {
+  tinylport* ud = luaL_checkudata( L, idx, TLT_WPORT_NAME );
+  if( !ud->p )
+    luaL_error( L, "attempt to use invalid port" );
   return ud;
 }
 
 
 
-static int detached_final_gc( lua_State* L ) {
-  tinylthread* thread = NULL;
-  int is_detached = 0;
-  lua_getfield( L, LUA_REGISTRYINDEX, TLT_THISTHREAD );
-  thread = lua_touserdata( L, -1 );
-  if( thread != NULL &&
-      thrd_success == mtx_lock( &(thread->t->thread_mutex) ) ) {
-    is_detached = thread->t->is_detached;
-    mtx_unlock( &(thread->t->thread_mutex) );
+static int is_interrupted( tinylthread* th, int* disabled ) {
+  int v = 0;
+  int dummy = 0;
+  if( !disabled )
+    disabled = &dummy;
+  if( th != NULL &&
+      thrd_success == mtx_lock( &(th->t->mutex) ) ) {
+    *disabled |= th->t->ignore_interrupt;
+    if( th->t->is_interrupted ) {
+      if( !*disabled )
+        v = 1;
+      th->t->ignore_interrupt = 0;
+    }
+    mtx_unlock( &(th->t->mutex) );
   }
+  return v;
+}
+
+static void throw_interrupted( lua_State* L ) {
+  getudatafromregistry( L, TLT_INTERRUPTED );
+  lua_error( L );
+}
+
+
+static void set_condition( tinylthread* th, cnd_t* c ) {
+  if( th != NULL &&
+      thrd_success == mtx_lock( &(th->t->mutex) ) ) {
+    th->t->condition = c;
+    mtx_unlock( &(th->t->mutex) );
+  }
+}
+
+
+static int cleanup_thread( lua_State* L ) {
+  int* memory_problem = lua_touserdata( L, 1 );
+  tinylthread* th = getudatafromregistry( L, TLT_THISTHREAD );
+  int is_detached = 0;
+  lua_settop( L, 0 );
+  if( th != NULL && thrd_success == mtx_lock( &(th->t->mutex) ) ) {
+    is_detached = th->t->is_detached;
+    mtx_unlock( &(th->t->mutex) );
+  }
+  lua_settop( L, 0 );
   if( is_detached ) {
     /* the Lua states of detached threads might never be collected,
      * so we clean up as best as we can ... */
     lua_gc( L, LUA_GCCOLLECT, 0 );
     lua_gc( L, LUA_GCCOLLECT, 0 );
   }
-  return 0;
-}
-
-
-static int mark_thread_dead( lua_State* L ) {
-  int* status = lua_touserdata( L, 1 );
-  tinylthread* thread = NULL;
-  lua_getfield( L, LUA_REGISTRYINDEX, TLT_THISTHREAD );
-  thread = lua_touserdata( L, -1 );
-  if( thread != NULL &&
-      thrd_success == mtx_lock( &(thread->t->thread_mutex) ) ) {
-    thread->t->exit_status = *status;
-    thread->t->is_dead = 1;
-    mtx_unlock( &(thread->t->thread_mutex) );
+  if( *memory_problem ) {
+    lua_pushliteral( L, "memory allocation error" );
+    return 1;
   }
   return 0;
 }
@@ -138,12 +188,16 @@ static int mark_thread_dead( lua_State* L ) {
 
 static int tinylthread_thunk( void* arg ) {
   lua_State* L = arg;
-  int status = lua_pcall( L, lua_gettop( L ), 0, 0 );
-  if( 0 != lua_cpcallr( L, detached_final_gc, NULL, 0 ) )
+  int memprob = 0;
+  int status = lua_pcall( L, lua_gettop( L )-1, LUA_MULTRET, 0 );
+  if( !lua_checkstack( L, 5+LUA_MINSTACK ) ) {
+    memprob = 1;
+    lua_settop( L, 0 ); /* make room */
+  }
+  if( 0 != lua_cpcallr( L, cleanup_thread, &memprob, !!memprob ) &&
+      !memprob )
     lua_pop( L, 1 ); /* pop error message if necessary */
-  if( 0 != lua_cpcallr( L, mark_thread_dead, &status, 0 ) )
-    lua_pop( L, 1 ); /* pop error message if necessary */
-  return status != 0;
+  return memprob ? LUA_ERRMEM : status;
 }
 
 
@@ -152,7 +206,7 @@ static void copy_to_thread( lua_State* toL, lua_State* fromL ) {
   int top = lua_gettop( fromL );
   int i = 1;
   luaL_checkstack( toL, top+LUA_MINSTACK, "copy_to_thread" );
-  for( i = 1; i < top; ++i ) {
+  for( i = 1; i <= top; ++i ) {
     switch( lua_type( fromL, i ) ) {
       case LUA_TNIL:
         lua_pushnil( toL );
@@ -173,17 +227,17 @@ static void copy_to_thread( lua_State* toL, lua_State* fromL ) {
           lua_pushnumber( toL, lua_tonumber( fromL, i ) );
         break;
       case LUA_TUSERDATA:
-        /* check that the userdata has `__name` and `__tinylthread@pipe`
+        /* check that the userdata has `__name` and `__tinylthread@copy`
          * metafields, and that there exists a corresponding metatable
          * in the registry of the target Lua state */
         lua_getmetatable( fromL, i );
         if( lua_istable( fromL, -1 ) ) {
-          tinylpipe_copyf copyf = 0;
+          tinylport_copyf copyf = 0;
           lua_pushliteral( fromL, "__name" );
           lua_rawget( fromL, -2 );
-          lua_pushliteral( fromL, "__tinylthread@pipe" );
+          lua_pushliteral( fromL, "__tinylthread@copy" );
           lua_rawget( fromL, -3 );
-          copyf = (tinylpipe_copyf)lua_tocfunction( fromL, -1 );
+          copyf = (tinylport_copyf)lua_tocfunction( fromL, -1 );
           lua_pop( fromL, 1 ); /* copyf */
           if( copyf != 0 && lua_type( fromL, -1 ) == LUA_TSTRING ) {
             int equal = 0;
@@ -211,11 +265,11 @@ static void copy_to_thread( lua_State* toL, lua_State* fromL ) {
           lua_pop( fromL, 1 ); /* pop name */
         }
         lua_pop( fromL, 1 ); /* pop metatable */
-        luaL_error( toL, "bad argument #%d (unsupported type: 'userdata')",
+        luaL_error( toL, "bad value #%d (unsupported type: 'userdata')",
                     i );
         break;
       default:
-        luaL_error( toL, "bad argument #%d (unsupported type: '%s')",
+        luaL_error( toL, "bad value #%d (unsupported type: '%s')",
                     i, luaL_typename( fromL, i ) );
         break;
     }
@@ -261,7 +315,7 @@ static int prepare_thread_state( lua_State* childL ) {
   lua_setfield( childL, LUA_REGISTRYINDEX, TLT_THISTHREAD );
   /* load lua code for the thread main function */
   s = lua_tolstring( childL, 1, &len );
-  if( 0 != luaL_loadbuffer( childL, s, len, "=threadMain" ) )
+  if( 0 != luaL_loadbuffer( childL, s, len, "=threadmain" ) )
     lua_error( childL );
   lua_replace( childL, 1 );
   return lua_gettop( childL );
@@ -273,14 +327,15 @@ static int prepare_thread_state( lua_State* childL ) {
  * exception is thrown! */
 static int get_error_message( lua_State* L ) {
   lua_State* fromL = lua_touserdata( L, 1 );
-  size_t len = 0;
-  char const* msg = 0;
-  if( lua_type( fromL, -1 ) != LUA_TSTRING )
-    luaL_error( L, "thread state initialization failed" );
-  msg = lua_tolstring( fromL, -1, &len );
-  lua_pushlstring( L, msg, len );
-  lua_error( L );
-  return 0;
+#define S "thread state initialization failed"
+  size_t len = sizeof( S )-1;
+  char const* msg = S;
+#undef S
+  if( lua_type( fromL, -1 ) == LUA_TSTRING ) {
+    msg = lua_tolstring( fromL, -1, &len );
+    lua_pushlstring( L, msg, len );
+  }
+  return 1;
 }
 
 
@@ -303,37 +358,32 @@ static int tinylthread_newthread( lua_State* L ) {
     lua_pushnil( L );
   }
   lua_replace( L, -3 ); /* remove package table */
-  ud->t = malloc( sizeof( tinylthread ) );
+  ud->t = malloc( sizeof( *ud->t ) );
   if( !ud->t )
     luaL_error( L, "memory allocation error" );
+  ud->t->condition = NULL;
   ud->t->exit_status = 0;
-  ud->t->is_interrupted = 0;
   ud->t->is_detached = 0;
-  ud->t->is_dead = 1;
+  ud->t->is_interrupted = 0;
+  ud->t->ignore_interrupt = 0;
   ud->t->ref.cnt = 1;
   if( thrd_success != mtx_init( &(ud->t->ref.mtx), mtx_plain ) ) {
     free( ud->t );
     ud->t = NULL;
     luaL_error( L, "mutex initialization failed" );
   }
-  if( thrd_success != mtx_init( &(ud->t->thread_mutex), mtx_plain) ) {
+  if( thrd_success != mtx_init( &(ud->t->mutex), mtx_plain ) ) {
     mtx_destroy( &(ud->t->ref.mtx ) );
     free( ud->t );
     ud->t = NULL;
     luaL_error( L, "mutex initialization failed" );
   }
-  ud->t->L = luaL_newstate();
-  tempL = ud->t->L;
-  if( !ud->t->L ) {
-    mtx_destroy( &(ud->t->ref.mtx) );
-    mtx_destroy( &(ud->t->thread_mutex) );
-    free( ud->t );
-    ud->t = NULL;
+  ud->t->L = tempL = luaL_newstate();
+  if( !tempL )
     luaL_error( L, "memory allocation error" );
-  }
   /* prepare the Lua state for the child thread */
   if( 0 != lua_cpcallr( ud->t->L, prepare_thread_state, L, LUA_MULTRET ) ) {
-    lua_cpcallr( L, get_error_message, ud->t->L, 0 );
+    lua_cpcallr( L, get_error_message, ud->t->L, 1 );
     ud->t->L = NULL;
     lua_close( tempL );
     lua_error( L ); /* rethrow the error from `get_error_message`  */
@@ -344,19 +394,18 @@ static int tinylthread_newthread( lua_State* L ) {
   thunk = (thrd_start_t)lua_tocfunction( ud->t->L, -1 );
   lua_pop( ud->t->L, 1 );
   /* lock this structure and create a C thread */
-  if( thrd_success != mtx_lock( &(ud->t->thread_mutex) ) ) {
+  if( thrd_success != mtx_lock( &(ud->t->mutex) ) ) {
     ud->t->L = NULL;
     lua_close( tempL );
     luaL_error( L, "mutex locking failed" );
   }
   if( thrd_success != thrd_create( &(ud->t->thread), thunk, ud->t->L ) ) {
-    mtx_unlock( &(ud->t->thread_mutex) );
+    mtx_unlock( &(ud->t->mutex) );
     ud->t->L = NULL;
     lua_close( tempL );
     luaL_error( L, "thread spawning failed" );
   }
-  ud->t->is_dead = 0;
-  mtx_unlock( &(ud->t->thread_mutex) );
+  mtx_unlock_or_die( L, &(ud->t->mutex) );
   return 1;
 }
 
@@ -380,28 +429,16 @@ static int tinylthread_gc( lua_State* L ) {
   tinylthread* ud = lua_touserdata( L, 1 );
   if( ud->t ) {
     int raise_error = 0;
-    int is_dead = 0;
-    if( ud->is_parent ) {
-      if( thrd_success == mtx_lock( &(ud->t->thread_mutex) ) ) {
-        raise_error = !ud->t->is_detached && ud->t->L;
-        is_dead = ud->t->is_dead;
-        mtx_unlock( &(ud->t->thread_mutex) );
-      }
+    if( ud->is_parent &&
+        thrd_success == mtx_lock( &(ud->t->mutex) ) ) {
+      raise_error = !ud->t->is_detached && ud->t->L != NULL;
+      mtx_unlock( &(ud->t->mutex) );
     }
-    switch( decref( L, &(ud->t->ref) ) ) {
-      case 1:
-        if( ud->is_parent && is_dead && ud->t->L ) {
-          lua_State* tempL = ud->t->L;
-          ud->t->L = NULL;
-          lua_close( tempL );
-        }
-        break;
-      case 0:
-        mtx_destroy( &(ud->t->ref.mtx) );
-        mtx_destroy( &(ud->t->thread_mutex) );
-        free( ud->t );
-        ud->t = NULL;
-        break;
+    if( 0 == decref( L, &(ud->t->ref) ) ) {
+      mtx_destroy( &(ud->t->ref.mtx) );
+      mtx_destroy( &(ud->t->mutex) );
+      free( ud->t );
+      ud->t = NULL;
     }
     if( raise_error )
       luaL_error( L, "collecting non-joined thread" );
@@ -412,56 +449,90 @@ static int tinylthread_gc( lua_State* L ) {
 
 static int tinylthread_detach( lua_State* L ) {
   tinylthread* ud = check_thread( L, 1 );
+  int is_detached = 0;
+  int is_joined = 0;
+  int status = 0;
   if( !ud->is_parent )
     luaL_error( L, "detach request from unrelated thread" );
-  /* TODO */
-  return 0;
+  mtx_lock_or_die( L, &(ud->t->mutex) );
+  is_detached = ud->t->is_detached;
+  is_joined = ud->t->L == NULL;
+  if( !is_detached && !is_joined ) {
+    status = thrd_detach( ud->t->thread );
+    if( status == thrd_success )
+      ud->t->is_detached = 1;
+  }
+  mtx_unlock_or_die( L, &(ud->t->mutex) );
+  if( is_detached )
+    luaL_error( L, "attempt to detach an already detached thread" );
+  if( is_joined )
+    luaL_error( L, "attempt to detach an already joined thread" );
+  if( status == thrd_success ) {
+    lua_pushboolean( L, 1 );
+    return 1;
+  } else {
+    lua_pushnil( L );
+    lua_pushliteral( L, "thread detaching failed" );
+    return 2;
+  }
 }
 
 
+typedef struct {
+  int status;
+  lua_State* L;
+} join_data;
+
+static int join_return_values( lua_State* L ) {
+  join_data* data = lua_touserdata( L, 1 );
+  lua_pop( L, 1 );
+  lua_pushboolean( L, data->status == 0 );
+  copy_to_thread( L, data->L );
+  return lua_gettop( L );
+}
+
 static int tinylthread_join( lua_State* L ) {
   tinylthread* ud = check_thread( L, 1 );
+  int is_detached = 0;
+  int is_joined = 0;
+  join_data data = { 0, NULL };
   if( !ud->is_parent )
     luaL_error( L, "join request from unrelated thread" );
-  /* TODO */
-  return 0;
+  mtx_lock_or_die( L, &(ud->t->mutex) );
+  is_detached = ud->t->is_detached;
+  is_joined = ud->t->L == NULL;
+  mtx_unlock_or_die( L, &(ud->t->mutex) );
+  if( is_detached )
+    luaL_error( L, "attempt to join an already detached thread" );
+  if( is_joined )
+    luaL_error( L, "attempt to join an already joined thread" );
+  if( thrd_success != thrd_join( ud->t->thread, &(data.status) ) )
+    luaL_error( L, "thread joining failed" );
+  mtx_lock_or_die( L, &(ud->t->mutex) );
+  data.L = ud->t->L;
+  ud->t->L = NULL;
+  if( thrd_success != mtx_unlock( &(ud->t->mutex) ) ) {
+    lua_close( data.L );
+    luaL_error( L, "mutex unlocking failed" );
+  }
+  lua_settop( L, 0 );
+  if( 0 != lua_cpcallr( L, join_return_values, &data, LUA_MULTRET ) ) {
+    lua_close( data.L );
+    lua_error( L );
+  }
+  lua_close( data.L );
+  return lua_gettop( L );
 }
 
 
 static int tinylthread_interrupt( lua_State* L ) {
   tinylthread* ud = check_thread( L, 1 );
-  if( thrd_success == mtx_lock( &(ud->t->thread_mutex) ) )
-    luaL_error( L, "mutex locking failed" );
+  mtx_lock_or_die( L, &(ud->t->mutex) );
   ud->t->is_interrupted = 1;
-  if( thrd_success != mtx_unlock( &(ud->t->thread_mutex) ) )
-    luaL_error( L, "mutex unlocking failed" );
+  if( ud->t->condition )
+    cnd_broadcast( ud->t->condition );
+  mtx_unlock_or_die( L, &(ud->t->mutex) );
   return 0;
-}
-
-
-static int tinylthread_isdead( lua_State* L ) {
-  tinylthread* ud = check_thread( L, 1 );
-  int v = 0;
-  if( thrd_success != mtx_lock( &(ud->t->thread_mutex) ) )
-    luaL_error( L, "mutex locking failed" );
-  v = ud->t->is_dead;
-  if( thrd_success != mtx_unlock( &(ud->t->thread_mutex) ) )
-    luaL_error( L, "mutex unlocking failed" );
-  lua_pushboolean( L, v );
-  return 1;
-}
-
-
-static int tinylthread_isdetached( lua_State* L ) {
-  tinylthread* ud = check_thread( L, 1 );
-  int v = 0;
-  if( thrd_success != mtx_lock( &(ud->t->thread_mutex) ) )
-    luaL_error( L, "mutex locking failed" );
-  v = ud->t->is_detached;
-  if( thrd_success != mtx_unlock( &(ud->t->thread_mutex) ) )
-    luaL_error( L, "mutex unlocking failed" );
-  lua_pushboolean( L, v );
-  return 1;
 }
 
 
@@ -469,9 +540,9 @@ static int tinylthread_isdetached( lua_State* L ) {
 static int tinylthread_newmutex( lua_State* L ) {
   tinylmutex* ud = lua_newuserdata( L, sizeof( *ud ) );
   ud->m = NULL;
-  ud->lock_count = 0;
+  ud->is_owner = 0;
   luaL_setmetatable( L, TLT_MTX_NAME );
-  ud->m = malloc( sizeof( tinylmutex ) );
+  ud->m = malloc( sizeof( *ud->m ) );
   if( !ud->m )
     luaL_error( L, "memory allocation error" );
   if( thrd_success != mtx_init( &(ud->m->ref.mtx), mtx_plain ) ) {
@@ -486,6 +557,13 @@ static int tinylthread_newmutex( lua_State* L ) {
     ud->m = NULL;
     luaL_error( L, "mutex initialization failed" );
   }
+  if( thrd_success != cnd_init( &(ud->m->unlocked) ) ) {
+    mtx_destroy( &(ud->m->ref.mtx) );
+    mtx_destroy( &(ud->m->mutex) );
+    free( ud->m );
+    ud->m = NULL;
+    luaL_error( L, "condition variable initialization failed" );
+  }
   return 1;
 }
 
@@ -494,7 +572,7 @@ static int tinylmutex_copy( void* p, lua_State* L, int midx ) {
   tinylmutex* ud = p;
   tinylmutex* copy = lua_newuserdata( L, sizeof( *copy ) );
   copy->m = NULL;
-  copy->lock_count = 0;
+  copy->is_owner = 0;
   lua_pushvalue( L, midx );
   lua_setmetatable( L, -2 );
   if( ud->m ) {
@@ -508,11 +586,15 @@ static int tinylmutex_copy( void* p, lua_State* L, int midx ) {
 static int tinylmutex_gc( lua_State* L ) {
   tinylmutex* ud = lua_touserdata( L, 1 );
   if( ud->m ) {
-    if( ud->lock_count > 0 )
+    if( ud->is_owner && mtx_lock( &(ud->m->mutex) ) ) {
+      ud->m->count = 0;
+      cnd_signal( &(ud->m->unlocked) );
       mtx_unlock( &(ud->m->mutex) );
+    }
     if( 0 == decref( L, &(ud->m->ref) ) ) {
       mtx_destroy( &(ud->m->ref.mtx) );
       mtx_destroy( &(ud->m->mutex) );
+      cnd_destroy( &(ud->m->unlocked) );
       free( ud->m );
     }
     ud->m = NULL;
@@ -523,65 +605,185 @@ static int tinylmutex_gc( lua_State* L ) {
 
 static int tinylmutex_lock( lua_State* L ) {
   tinylmutex* ud = check_mutex( L, 1 );
-  if( thrd_success != mtx_lock( &(ud->m->mutex) ) )
-    luaL_error( L, "mutex locking failed" );
-  ud->lock_count++;
-  return 0;
+  tinylthread* th = getudatafromregistry( L, TLT_THISTHREAD );
+  int disabled = 0;
+  int itr = 0;
+  mtx_lock_or_die( L, &(ud->m->mutex) );
+  while( !(itr=is_interrupted( th, &disabled )) &&
+         ud->m->count > 0 && !ud->is_owner ) {
+    set_condition( th, &(ud->m->unlocked) );
+    if( thrd_success != cnd_wait( &(ud->m->unlocked), &(ud->m->mutex) ) ) {
+      set_condition( th, NULL );
+      mtx_unlock( &(ud->m->mutex) );
+      luaL_error( L, "waiting on condition variable failed" );
+    }
+    set_condition( th, NULL );
+  }
+  if( itr ) {
+    mtx_unlock( &(ud->m->mutex) );
+    throw_interrupted( L );
+  }
+  ud->is_owner = 1;
+  ud->m->count++;
+  mtx_unlock_or_die( L, &(ud->m->mutex) );
+  lua_pushboolean( L, 1 );
+  return 1;
 }
 
 
 static int tinylmutex_trylock( lua_State* L ) {
   tinylmutex* ud = check_mutex( L, 1 );
-  int success = 0;
-  switch( mtx_trylock( &(ud->m->mutex) ) ) {
-    case thrd_success:
-      ud->lock_count++;
-      success = 1;
-      break;
-    case thrd_busy:
-      break;
-    default:
-      luaL_error( L, "mutex locking failed" );
-      break;
+  tinylthread* th = getudatafromregistry( L, TLT_THISTHREAD );
+  if( is_interrupted( th, NULL ) )
+    throw_interrupted( L );
+  mtx_lock_or_die( L, &(ud->m->mutex) );
+  if( ud->m->count > 0 && !ud->is_owner ) {
+    mtx_unlock_or_die( L, &(ud->m->mutex) );
+    lua_pushboolean( L, 0 );
+  } else {
+    ud->m->count++;
+    ud->is_owner = 1;
+    mtx_unlock_or_die( L, &(ud->m->mutex) );
+    lua_pushboolean( L, 1 );
   }
-  lua_pushboolean(L, success );
   return 1;
 }
 
 
 static int tinylmutex_unlock( lua_State* L ) {
   tinylmutex* ud = check_mutex( L, 1 );
-  if( ud->lock_count == 0 )
-    luaL_error( L, "trying to unlock non-locked mutex" );
-  if( thrd_success != mtx_unlock( &(ud->m->mutex) ) )
-    luaL_error( L, "mutex unlocking failed" );
-  ud->lock_count--;
-  return 0;
+  tinylthread* th = getudatafromregistry( L, TLT_THISTHREAD );
+  int locked = 0;
+  int owner = ud->is_owner;
+  mtx_lock_or_die( L, &(ud->m->mutex) );
+  locked = ud->m->count > 0;
+  if( locked && owner &&
+      --(ud->m->count) == 0 &&
+      ((ud->is_owner = 0), 1) &&
+      thrd_success != cnd_signal( &(ud->m->unlocked) ) ) {
+    mtx_unlock( &(ud->m->mutex) );
+    luaL_error( L, "signaling waiting threads failed" );
+  }
+  mtx_unlock_or_die( L, &(ud->m->mutex) );
+  if( !locked )
+    luaL_error( L, "mutex is already unlocked" );
+  if( !owner )
+    luaL_error( L, "mutex is locked by another thread" );
+  if( is_interrupted( th, NULL ) )
+    throw_interrupted( L );
+  lua_pushboolean( L, 1 );
+  return 1;
 }
 
 
 
 static int tinylthread_newpipe( lua_State* L ) {
-  /* TODO */
-  return 0;
+  tinylport* ud1 = lua_newuserdata( L, sizeof( *ud1 ) );
+  tinylport* ud2 = lua_newuserdata( L, sizeof( *ud2 ) );
+  ud1->p = ud2->p = NULL;
+  luaL_setmetatable( L, TLT_WPORT_NAME );
+  lua_pushvalue( L, -2 );
+  luaL_setmetatable( L, TLT_RPORT_NAME );
+  lua_pop( L, 1 );
+  ud1->is_reader = 1;
+  ud2->is_reader = 0;
+  ud1->p = malloc( sizeof( *ud1->p ) );
+  if( !ud1->p )
+    luaL_error( L, "memory allocation error" );
+  if( thrd_success != mtx_init( &(ud1->p->ref.mtx), mtx_plain ) ) {
+    free( ud1->p );
+    ud1->p = NULL;
+    luaL_error( L, "mutex initialization failed" );
+  }
+  if( thrd_success != mtx_init( &(ud1->p->mutex), mtx_plain ) ) {
+    mtx_destroy( &(ud1->p->ref.mtx) );
+    free( ud1->p );
+    ud1->p = NULL;
+    luaL_error( L, "mutex initialization failed" );
+  }
+  if( thrd_success != cnd_init( &(ud1->p->data_copied) ) ) {
+    mtx_destroy( &(ud1->p->ref.mtx) );
+    mtx_destroy( &(ud1->p->mutex) );
+    free( ud1->p );
+    ud1->p = NULL;
+    luaL_error( L, "condition variable initialization failed" );
+  }
+  if( thrd_success != cnd_init( &(ud1->p->waiting_senders) ) ) {
+    mtx_destroy( &(ud1->p->ref.mtx) );
+    mtx_destroy( &(ud1->p->mutex) );
+    cnd_destroy( &(ud1->p->data_copied) );
+    free( ud1->p );
+    ud1->p = NULL;
+    luaL_error( L, "condition variable initialization failed" );
+  }
+  if( thrd_success != cnd_init( &(ud1->p->waiting_receivers) ) ) {
+    mtx_destroy( &(ud1->p->ref.mtx) );
+    mtx_destroy( &(ud1->p->mutex) );
+    cnd_destroy( &(ud1->p->data_copied) );
+    cnd_destroy( &(ud1->p->waiting_senders) );
+    free( ud1->p );
+    ud1->p = NULL;
+    luaL_error( L, "condition variable initialization failed" );
+  }
+  ud1->p->ref.cnt = 2;
+  ud2->p = ud1->p;
+  return 2;
 }
+
 
 static int tinylport_copy( void* p, lua_State* L, int midx ) {
-  /* TODO */
-  return 0;
+  tinylport* ud = p;
+  tinylport* copy = lua_newuserdata( L, sizeof( *copy ) );
+  copy->p = NULL;
+  copy->is_reader = ud->is_reader;
+  lua_pushvalue( L, midx );
+  lua_setmetatable( L, -2 );
+  if( ud->p ) {
+    incref( L, &(ud->p->ref) );
+    copy->p = ud->p;
+  }
+  return 1;
 }
+
 
 static int tinylport_gc( lua_State* L ) {
-  /* TODO */
+  tinylport* ud = lua_touserdata( L, 1 );
+  if( ud->p ) {
+    if( thrd_success == mtx_lock( &(ud->p->mutex) ) ) {
+      if( ud->is_reader ) {
+        if( 0 == --(ud->p->rports) )
+          cnd_broadcast( &(ud->p->waiting_senders) );
+      } else {
+        if( 0 == --(ud->p->wports) )
+          cnd_broadcast( &(ud->p->waiting_receivers) );
+      }
+      mtx_unlock( &(ud->p->mutex) );
+    }
+    if( 0 == decref( L, &(ud->p->ref) ) ) {
+      mtx_destroy( &(ud->p->ref.mtx) );
+      mtx_destroy( &(ud->p->mutex) );
+      cnd_destroy( &(ud->p->data_copied) );
+      cnd_destroy( &(ud->p->waiting_senders) );
+      cnd_destroy( &(ud->p->waiting_receivers) );
+      free( ud->p );
+    }
+    ud->p = NULL;
+  }
   return 0;
 }
+
 
 static int tinylport_read( lua_State* L ) {
+  tinylport* ud = check_rport( L, 1 );
+  (void)ud;
   /* TODO */
   return 0;
 }
 
+
 static int tinylport_write( lua_State* L ) {
+  tinylport* ud = check_wport( L, 1 );
+  (void)ud;
   /* TODO */
   return 0;
 }
@@ -589,7 +791,7 @@ static int tinylport_write( lua_State* L ) {
 
 
 static int tinylitr_tostring( lua_State* L ) {
-  lua_pushliteral( L, "interrupted thread" );
+  lua_pushliteral( L, "thread interrupted" );
   return 1;
 }
 
@@ -606,14 +808,42 @@ static int tinylitr_copy( void* p, lua_State* L, int midx ) {
 }
 
 
-static int tinylthread_disable( lua_State* L ) {
-  /* TODO */
+
+static int tinylthread_sleep( lua_State* L ) {
+  lua_Number seconds = luaL_checknumber( L, 1 );
+  tinylthread* th = getudatafromregistry( L, TLT_THISTHREAD );
+  int disabled = 0;
+  int itr = 0;
+  int ret = 0;
+  struct timespec a, b;
+  struct timespec* duration = &a;
+  struct timespec* remaining = &b;
+  luaL_argcheck( L, seconds >= 0, 1, "positive number expected" );
+  duration->tv_sec = (time_t)seconds;
+  duration->tv_nsec = (long)((seconds-floor(seconds))*1000000000L);
+  if( duration->tv_sec > 0 || duration->tv_nsec > 0 ) {
+    while( !(itr=is_interrupted( th, &disabled )) &&
+           -1 == (ret=thrd_sleep( duration, remaining )) ) {
+      struct timespec* temp = duration;
+      duration = remaining;
+      remaining = temp;
+    }
+  }
+  if( itr || is_interrupted( th, &disabled ) )
+    throw_interrupted( L );
+  if( ret < 0 )
+    luaL_error( L, "sleep failed" );
   return 0;
 }
 
 
-static int tinylthread_check( lua_State* L ) {
-  /* TODO */
+static int tinylthread_delay( lua_State* L ) {
+  tinylthread* th = getudatafromregistry( L, TLT_THISTHREAD );
+  if( th != NULL ) {
+    mtx_lock_or_die( L, &(th->t->mutex) );
+    th->t->ignore_interrupt = 1;
+    mtx_unlock_or_die( L, &(th->t->mutex) );
+  }
   return 0;
 }
 
@@ -630,7 +860,7 @@ static void create_meta( lua_State* L, char const* name,
                          luaL_Reg const* methods,
                          luaL_Reg const* metas ) {
   if( !luaL_newmetatable( L, name ) )
-    luaL_error( L, "%s metatable already exists", name );
+    luaL_error( L, "'%s' metatable already exists", name );
 #if LUA_VERSION_NUM < 503
   lua_pushstring( L, name );
   lua_setfield( L, -2, "__name" );
@@ -662,21 +892,19 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
     { "thread", tinylthread_newthread },
     { "mutex", tinylthread_newmutex },
     { "pipe", tinylthread_newpipe },
-    { "disableinterrupt", tinylthread_disable },
-    { "checkinterrupt", tinylthread_check },
+    { "sleep", tinylthread_sleep },
+    { "delay", tinylthread_delay },
     { NULL, NULL }
   };
   luaL_Reg const thread_methods[] = {
     { "detach", tinylthread_detach },
     { "join", tinylthread_join },
     { "interrupt", tinylthread_interrupt },
-    { "isdead", tinylthread_isdead },
-    { "isdetached", tinylthread_isdetached },
     { NULL, NULL }
   };
   luaL_Reg const thread_metas[] = {
     { "__gc", tinylthread_gc },
-    { "__tinylthread@pipe", (lua_CFunction)tinylthread_copy },
+    { "__tinylthread@copy", (lua_CFunction)tinylthread_copy },
     { NULL, NULL }
   };
   luaL_Reg const mutex_methods[] = {
@@ -687,7 +915,7 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
   };
   luaL_Reg const mutex_metas[] = {
     { "__gc", tinylmutex_gc },
-    { "__tinylthread@pipe", (lua_CFunction)tinylmutex_copy },
+    { "__tinylthread@copy", (lua_CFunction)tinylmutex_copy },
     { NULL, NULL }
   };
   luaL_Reg const rport_methods[] = {
@@ -700,12 +928,12 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
   };
   luaL_Reg const port_metas[] = {
     { "__gc", tinylport_gc },
-    { "__tinylthread@pipe", (lua_CFunction)tinylport_copy },
+    { "__tinylthread@copy", (lua_CFunction)tinylport_copy },
     { NULL, NULL }
   };
   luaL_Reg const itr_metas[] = {
     { "__tostring", tinylitr_tostring },
-    { "__tinylthread@pipe", (lua_CFunction)tinylitr_copy },
+    { "__tinylthread@copy", (lua_CFunction)tinylitr_copy },
     { NULL, NULL }
   };
   /* create a struct containing function pointers to functions useful
