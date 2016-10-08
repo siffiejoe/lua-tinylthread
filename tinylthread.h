@@ -36,7 +36,7 @@
 /* other important keys in the registry */
 #define TLT_THISTHREAD  "tinylthread.this"
 #define TLT_THUNK       "tinylthread.thunk"
-#define TLT_INTERRUPTED "tinylthread.interrupt.err"
+#define TLT_INTERRUPT   "tinylthread.interrupt.error"
 #define TLT_C_API_V1    "tinylthread.c.api.v1"
 
 
@@ -48,7 +48,7 @@ typedef struct {
 } tinylheader;
 
 
-/* thread handle userdata type */
+/* shared part of thread handle userdata type */
 typedef struct {
   tinylheader ref;
   thrd_t thread;
@@ -61,8 +61,9 @@ typedef struct {
   char ignore_interrupt;
 } tinylthread_shared;
 
+/* thread handle userdata type */
 typedef struct {
-  tinylthread_shared* t;
+  tinylthread_shared* s;
   char is_parent;
 } tinylthread;
 
@@ -77,7 +78,7 @@ typedef struct {
 
 /* mutex handle userdata type */
 typedef struct {
-  tinylmutex_shared* m;
+  tinylmutex_shared* s;
   char is_owner;
 } tinylmutex;
 
@@ -97,9 +98,10 @@ typedef struct {
  * sender:
  * - lock the mutex
  * - while L == NULL and rports > 0 wait on waiting_senders
- * - raise error if rports == 0 or interrupted
+ * - raise error if rports == 0 or (interrupted and L == 0)
  * - copy value to L
  * - signal data_copied
+ * - raise error if interrupted
  */
 typedef struct {
   tinylheader ref;
@@ -114,7 +116,7 @@ typedef struct {
 
 /* port userdata type */
 typedef struct {
-  tinylport_shared* p;
+  tinylport_shared* s;
   char is_reader;
 } tinylport;
 
