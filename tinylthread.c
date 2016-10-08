@@ -545,12 +545,13 @@ static int tinylthread_newmutex( lua_State* L ) {
   ud->s = malloc( sizeof( *ud->s ) );
   if( !ud->s )
     luaL_error( L, "memory allocation error" );
+  ud->s->ref.cnt = 1;
+  ud->s->count = 0;
   if( thrd_success != mtx_init( &(ud->s->ref.mtx), mtx_plain ) ) {
     free( ud->s );
     ud->s = NULL;
     luaL_error( L, "mutex initialization failed" );
   }
-  ud->s->ref.cnt = 1;
   if( thrd_success != mtx_init( &(ud->s->mutex), mtx_plain ) ) {
     mtx_destroy( &(ud->s->ref.mtx) );
     free( ud->s );
@@ -696,6 +697,7 @@ static int tinylthread_newpipe( lua_State* L ) {
   ud1->s = malloc( sizeof( *ud1->s ) );
   if( !ud1->s )
     luaL_error( L, "memory allocation error" );
+  ud1->s->ref.cnt = 2;
   if( thrd_success != mtx_init( &(ud1->s->ref.mtx), mtx_plain ) ) {
     free( ud1->s );
     ud1->s = NULL;
@@ -731,7 +733,6 @@ static int tinylthread_newpipe( lua_State* L ) {
     ud1->s = NULL;
     luaL_error( L, "condition variable initialization failed" );
   }
-  ud1->s->ref.cnt = 2;
   ud2->s = ud1->s;
   return 2;
 }
