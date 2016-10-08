@@ -665,12 +665,18 @@ static int tinylmutex_unlock( lua_State* L ) {
     luaL_error( L, "signaling waiting threads failed" );
   }
   mtx_unlock_or_die( L, &(ud->s->mutex) );
-  if( !locked )
-    luaL_error( L, "mutex is already unlocked" );
-  if( !owner )
-    luaL_error( L, "mutex is locked by another thread" );
   if( is_interrupted( th, NULL ) )
     throw_interrupt( L );
+  if( !locked ) {
+    lua_pushnil( L );
+    lua_pushliteral( L, "mutex is already unlocked" );
+    return 2;
+  }
+  if( !owner ) {
+    lua_pushnil( L );
+    lua_pushliteral( L, "mutex is locked by another thread" );
+    return 2;
+  }
   lua_pushboolean( L, 1 );
   return 1;
 }
