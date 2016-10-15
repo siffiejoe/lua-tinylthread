@@ -48,12 +48,21 @@ typedef struct {
 } tinylheader;
 
 
+/* a structure that contains all information about where a
+ * tinylthread is currently blocked */
+typedef struct {
+  tinylheader* header;
+  cnd_t* condition;
+  mtx_t* mutex;
+} tinylblock;
+
+
 /* shared part of thread handle userdata type */
 typedef struct {
   tinylheader ref;
   thrd_t thread;
   mtx_t mutex;
-  cnd_t* condition;  /* non-NULL if thread is waiting */
+  tinylblock block;  /* contains info if thread is blocked */
   lua_State* L;  /* as long as it lives only the child may access L */
   int  exit_status;
   char is_detached;

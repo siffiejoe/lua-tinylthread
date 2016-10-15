@@ -4,6 +4,7 @@
 #include "tinylthread.h"
 
 
+
 /* compatibility for older Lua versions */
 #if LUA_VERSION_NUM <= 501
 #  define luaL_setmetatable( L, tn ) \
@@ -157,8 +158,8 @@ static int is_interrupted( tinylthread* thread, int* disabled ) {
     if( thread->s->is_interrupted ) {
       if( !*disabled )
         v = 1;
-      thread->s->ignore_interrupt = 0;
     }
+    thread->s->ignore_interrupt = 0;
     no_fail( mtx_unlock( &(thread->s->mutex) ) );
   }
   return v;
@@ -170,10 +171,13 @@ static void throw_interrupt( lua_State* L ) {
 }
 
 
-static void set_condition( tinylthread* thread, cnd_t* c ) {
+static void set_block( tinylthread* thread, tinylheader* h,
+                       cnd_t* c, mtx_t* m ) {
   if( thread != NULL &&
       thrd_success == mtx_lock( &(thread->s->mutex) ) ) {
-    thread->s->condition = c;
+    thread->s->block.header = h;
+    thread->s->block.condition = c;
+    thread->s->block.mutex = m;
     no_fail( mtx_unlock( &(thread->s->mutex) ) );
   }
 }
@@ -414,7 +418,9 @@ static int tinylthread_new_thread( lua_State* L ) {
   thread->s = malloc( sizeof( *thread->s ) );
   if( !thread->s )
     luaL_error( L, "memory allocation error" );
-  thread->s->condition = NULL;
+  thread->s->block.header = NULL;
+  thread->s->block.condition = NULL;
+  thread->s->block.mutex = NULL;
   thread->s->exit_status = 0;
   thread->s->is_detached = 0;
   thread->s->is_interrupted = 0;
@@ -585,11 +591,25 @@ static int tinylthread_join( lua_State* L ) {
 
 static int tinylthread_interrupt( lua_State* L ) {
   tinylthread* thread = check_thread( L, 1 );
+  tinylblock block;
   mtx_lock_or_throw( L, &(thread->s->mutex) );
   thread->s->is_interrupted = 1;
-  if( thread->s->condition )
-    no_fail( cnd_broadcast( thread->s->condition ) );
-  no_fail( mtx_unlock( &(thread->s->mutex) ) );
+  block = thread->s->block;
+  if( block.header ) {
+    /* prevent structure containing block from disappearing */
+    no_fail( mtx_lock( &(block.header->mtx) ) );
+    /* we must release the thread mutex anyway to avoid a deadlock
+     * when acquiring the block mutex */
+    no_fail( mtx_unlock( &(thread->s->mutex) ) );
+    /* acquire the lock for the condition variable to make sure that
+     * the thread is actually waiting on it! */
+    no_fail( mtx_lock( block.mutex ) );
+    /* wake up the thread */
+    no_fail( cnd_broadcast( block.condition ) );
+    no_fail( mtx_unlock( block.mutex ) );
+    no_fail( mtx_unlock( &(block.header->mtx) ) );
+  } else
+    no_fail( mtx_unlock( &(thread->s->mutex) ) );
   return 0;
 }
 
@@ -670,14 +690,15 @@ static int tinylmutex_lock( lua_State* L ) {
   mtx_lock_or_throw( L, &(mutex->s->mutex) );
   while( !(itr=is_interrupted( thread, &disabled )) &&
          mutex->s->count > 0 && !mutex->is_owner ) {
-    set_condition( thread, &(mutex->s->unlocked) );
+    set_block( thread, &(mutex->s->ref), &(mutex->s->unlocked),
+               &(mutex->s->mutex) );
     if( thrd_success !=
         cnd_wait( &(mutex->s->unlocked), &(mutex->s->mutex) ) ) {
-      set_condition( thread, NULL );
+      set_block( thread, NULL, NULL, NULL );
       no_fail( mtx_unlock( &(mutex->s->mutex) ) );
       luaL_error( L, "waiting on condition variable failed" );
     }
-    set_condition( thread, NULL );
+    set_block( thread, NULL, NULL, NULL );
   }
   if( itr ) {
     no_fail( mtx_unlock( &(mutex->s->mutex) ) );
@@ -852,14 +873,15 @@ static int tinylport_read( lua_State* L ) {
   while( !(itr=is_interrupted( thread, &disabled )) &&
          port->s->L != NULL &&
          port->s->wports > 0 ) {
-    set_condition( thread, &(port->s->waiting_receivers) );
+    set_block( thread, &(port->s->ref), &(port->s->waiting_receivers),
+               &(port->s->mutex) );
     if( thrd_success !=
         cnd_wait( &(port->s->waiting_receivers), &(port->s->mutex) ) ) {
-      set_condition( thread, NULL );
+      set_block( thread, NULL, NULL, NULL );
       no_fail( mtx_unlock( &(port->s->mutex) ) );
       luaL_error( L, "waiting on condition variable failed" );
     }
-    set_condition( thread, NULL );
+    set_block( thread, NULL, NULL, NULL );
   }
   if( itr ) { /* handle interrupt request */
     no_fail( mtx_unlock( &(port->s->mutex) ) );
@@ -879,24 +901,27 @@ static int tinylport_read( lua_State* L ) {
   while( !(itr=is_interrupted( thread, &disabled )) &&
          port->s->L == L &&
          port->s->wports > 0 ) {
-    set_condition( thread, &(port->s->data_copied) );
+    set_block( thread, &(port->s->ref), &(port->s->data_copied),
+               &(port->s->mutex) );
     if( thrd_success !=
         cnd_wait( &(port->s->data_copied), &(port->s->mutex) ) ) {
-      set_condition( thread, NULL );
+      set_block( thread, NULL, NULL, NULL );
       port->s->L = NULL;
       no_fail( cnd_signal( &(port->s->waiting_receivers) ) );
       no_fail( mtx_unlock( &(port->s->mutex) ) );
       luaL_error( L, "waiting on condition variable failed" );
     }
-    set_condition( thread, NULL );
+    set_block( thread, NULL, NULL, NULL );
   }
-  if( itr ) { /* handle interrupt request */
-    no_fail( mtx_unlock( &(port->s->mutex) ) );
-    throw_interrupt( L );
-  }
-  if( port->s->L == L && port->s->rports == 0 ) {
-    no_fail( mtx_unlock( &(port->s->mutex) ) );
-    luaL_error( L, "broken pipe" );
+  if( port->s->L == L ) { /* no data received */
+    if( itr ) { /* handle interrupt request */
+      no_fail( mtx_unlock( &(port->s->mutex) ) );
+      throw_interrupt( L );
+    }
+    if( port->s->wports == 0 ) {
+      no_fail( mtx_unlock( &(port->s->mutex) ) );
+      luaL_error( L, "broken pipe" );
+    }
   }
   no_fail( mtx_unlock( &(port->s->mutex) ) );
   return 1;
@@ -916,14 +941,15 @@ static int tinylport_write( lua_State* L ) {
   while( !(itr=is_interrupted( thread, &disabled )) &&
          port->s->L == NULL &&
          port->s->rports > 0 ) {
-    set_condition( thread, &(port->s->waiting_senders) );
+    set_block( thread, &(port->s->ref), &(port->s->waiting_senders),
+               &(port->s->mutex) );
     if( thrd_success !=
         cnd_wait( &(port->s->waiting_senders), &(port->s->mutex) ) ) {
-      set_condition( thread, NULL );
+      set_block( thread, NULL, NULL, NULL );
       no_fail( mtx_unlock( &(port->s->mutex) ) );
       luaL_error( L, "waiting on condition variable failed" );
     }
-    set_condition( thread, NULL );
+    set_block( thread, NULL, NULL, NULL );
   }
   if( itr ) { /* handle interrupt request */
     no_fail( mtx_unlock( &(port->s->mutex) ) );
