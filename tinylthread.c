@@ -318,20 +318,12 @@ static int copy_table( lua_State* toL, lua_State* fromL, int i ) {
 }
 
 
-/* all API calls on toL are protected, but all API calls on
- * fromL are *unprotected* and could cause resource leaks if
- * an unhandled error is thrown! */
-static void copy_to_thread( lua_State* toL, lua_State* fromL ) {
-  int top = lua_gettop( fromL );
-  int i = 1;
-  luaL_checkstack( toL, top+LUA_MINSTACK, "copy_to_thread" );
-  for( i = 1; i <= top; ++i ) {
-    if( !copy_primitive( toL, fromL, i ) &&
-        !copy_udata( toL, fromL, i ) &&
-        !copy_table( toL, fromL, i ) ) {
-      luaL_error( toL, "bad value #%d (unsupported type: '%s')",
-                  i, luaL_typename( fromL, i ) );
-    }
+static void copy_value_to_thread( lua_State* toL, lua_State* fromL, int i ) {
+  if( !copy_primitive( toL, fromL, i ) &&
+      !copy_udata( toL, fromL, i ) &&
+      !copy_table( toL, fromL, i ) ) {
+    luaL_error( toL, "bad value #%d (unsupported type: '%s')",
+                i, luaL_typename( fromL, i ) );
   }
 }
 
@@ -343,6 +335,8 @@ static int prepare_thread_state( lua_State* childL ) {
   lua_State* parentL = lua_touserdata( childL, 1 );
   size_t len = 0;
   char const* s = NULL;
+  int i = 1;
+  int top = 0;
   lua_pop( childL, 1 );
   luaL_openlibs( childL );
   /* take package (c)path from parent thread */
@@ -369,7 +363,10 @@ static int prepare_thread_state( lua_State* childL ) {
   lua_pushliteral( childL, "tinylthread" );
   lua_call( childL, 1, 0 );
   /* copy arguments from the lua_State of the parent */
-  copy_to_thread( childL, parentL );
+  top = lua_gettop( parentL );
+  luaL_checkstack( childL, top+LUA_MINSTACK, "prepare_thread_state" );
+  for( i = 1; i <= top; ++i )
+    copy_value_to_thread( childL, parentL, i );
   /* store away the child thread handle */
   lua_setfield( childL, LUA_REGISTRYINDEX, TLT_THISTHREAD );
   /* load lua code for the thread main function */
@@ -384,16 +381,13 @@ static int prepare_thread_state( lua_State* childL ) {
 /* all API calls on L are protected, but all API calls on fromL are
  * *unprotected* and could cause resource leaks if an unhandled
  * error is thrown! */
-static int get_error_message( lua_State* L ) {
+static int copy_stack_top( lua_State* L ) {
   lua_State* fromL = lua_touserdata( L, 1 );
-#define S "thread state initialization failed"
-  size_t len = sizeof( S )-1;
-  char const* msg = S;
-#undef S
-  if( lua_type( fromL, -1 ) == LUA_TSTRING ) {
-    msg = lua_tolstring( fromL, -1, &len );
-    lua_pushlstring( L, msg, len );
-  }
+  int top = lua_gettop( fromL );
+  if( top < 1 )
+    lua_pushnil( L );
+  else
+    copy_value_to_thread( L, fromL, top );
   return 1;
 }
 
@@ -443,10 +437,12 @@ static int tinylthread_new_thread( lua_State* L ) {
   /* prepare the Lua state for the child thread */
   if( 0 != lua_cpcallr( thread->s->L, prepare_thread_state, L,
                         LUA_MULTRET ) ) {
-    lua_cpcallr( L, get_error_message, thread->s->L, 1 );
+    int r = lua_cpcallr( L, copy_stack_top, thread->s->L, 1 );
     thread->s->L = NULL;
     lua_close( tempL );
-    lua_error( L ); /* rethrow the error from `get_error_message`  */
+    if( r != 0 )
+      lua_pushliteral( L, "thread initialization error" );
+    lua_error( L ); /* rethrow the error on this thread */
   }
   /* get thread main function from the child's registry (must not
    * raise an error!) */
@@ -544,11 +540,15 @@ typedef struct {
   lua_State* L;
 } join_data;
 
-static int join_return_values( lua_State* L ) {
+static int copy_return_values( lua_State* L ) {
   join_data* data = lua_touserdata( L, 1 );
+  int i = 1;
+  int top = lua_gettop( data->L );
   lua_pop( L, 1 );
   lua_pushboolean( L, data->status == 0 );
-  copy_to_thread( L, data->L );
+  luaL_checkstack( L, top+LUA_MINSTACK, "copy_return_values" );
+  for( i = 1; i <= top; ++i )
+    copy_value_to_thread( L, data->L, i );
   return lua_gettop( L );
 }
 
@@ -574,7 +574,7 @@ static int tinylthread_join( lua_State* L ) {
   thread->s->L = NULL;
   no_fail( mtx_unlock( &(thread->s->mutex) ) );
   lua_settop( L, 0 );
-  if( 0 != lua_cpcallr( L, join_return_values, &data, LUA_MULTRET ) ) {
+  if( 0 != lua_cpcallr( L, copy_return_values, &data, LUA_MULTRET ) ) {
     lua_close( data.L );
     lua_error( L );
   }
@@ -843,17 +843,115 @@ static int tinylport_gc( lua_State* L ) {
 
 static int tinylport_read( lua_State* L ) {
   tinylport* port = check_rport( L, 1 );
-  (void)port;
-  /* TODO */
-  return 0;
+  tinylthread* thread = NULL;
+  int itr = 0;
+  int disabled = 0;
+  lua_settop( L, 1 );
+  thread = get_udata_from_registry( L, TLT_THISTHREAD );
+  mtx_lock_or_throw( L, &(port->s->mutex) );
+  while( !(itr=is_interrupted( thread, &disabled )) &&
+         port->s->L != NULL &&
+         port->s->wports > 0 ) {
+    set_condition( thread, &(port->s->waiting_receivers) );
+    if( thrd_success !=
+        cnd_wait( &(port->s->waiting_receivers), &(port->s->mutex) ) ) {
+      set_condition( thread, NULL );
+      no_fail( mtx_unlock( &(port->s->mutex) ) );
+      luaL_error( L, "waiting on condition variable failed" );
+    }
+    set_condition( thread, NULL );
+  }
+  if( itr ) { /* handle interrupt request */
+    no_fail( mtx_unlock( &(port->s->mutex) ) );
+    throw_interrupt( L );
+  }
+  if( port->s->wports == 0 ) { /* no more senders alive */
+    no_fail( mtx_unlock( &(port->s->mutex) ) );
+    luaL_error( L, "broken pipe" );
+  }
+  port->s->L = L;
+  if( thrd_success !=
+      cnd_signal( &(port->s->waiting_senders) ) ) {
+    port->s->L = NULL;
+    no_fail( mtx_unlock( &(port->s->mutex) ) );
+    luaL_error( L, "signaling waiting threads failed" );
+  }
+  while( !(itr=is_interrupted( thread, &disabled )) &&
+         port->s->L == L &&
+         port->s->wports > 0 ) {
+    set_condition( thread, &(port->s->data_copied) );
+    if( thrd_success !=
+        cnd_wait( &(port->s->data_copied), &(port->s->mutex) ) ) {
+      set_condition( thread, NULL );
+      port->s->L = NULL;
+      no_fail( cnd_signal( &(port->s->waiting_receivers) ) );
+      no_fail( mtx_unlock( &(port->s->mutex) ) );
+      luaL_error( L, "waiting on condition variable failed" );
+    }
+    set_condition( thread, NULL );
+  }
+  if( itr ) { /* handle interrupt request */
+    no_fail( mtx_unlock( &(port->s->mutex) ) );
+    throw_interrupt( L );
+  }
+  if( port->s->L == L && port->s->rports == 0 ) {
+    no_fail( mtx_unlock( &(port->s->mutex) ) );
+    luaL_error( L, "broken pipe" );
+  }
+  no_fail( mtx_unlock( &(port->s->mutex) ) );
+  return 1;
 }
 
 
 static int tinylport_write( lua_State* L ) {
   tinylport* port = check_wport( L, 1 );
-  (void)port;
-  /* TODO */
-  return 0;
+  tinylthread* thread = NULL;
+  int itr = 0;
+  int disabled = 0;
+  luaL_checkany( L, 2 );
+  lua_settop( L, 2 );
+  thread = get_udata_from_registry( L, TLT_THISTHREAD );
+  lua_pushvalue( L, 2 );
+  mtx_lock_or_throw( L, &(port->s->mutex) );
+  while( !(itr=is_interrupted( thread, &disabled )) &&
+         port->s->L == NULL &&
+         port->s->rports > 0 ) {
+    set_condition( thread, &(port->s->waiting_senders) );
+    if( thrd_success !=
+        cnd_wait( &(port->s->waiting_senders), &(port->s->mutex) ) ) {
+      set_condition( thread, NULL );
+      no_fail( mtx_unlock( &(port->s->mutex) ) );
+      luaL_error( L, "waiting on condition variable failed" );
+    }
+    set_condition( thread, NULL );
+  }
+  if( itr ) { /* handle interrupt request */
+    no_fail( mtx_unlock( &(port->s->mutex) ) );
+    throw_interrupt( L );
+  }
+  if( port->s->rports == 0 ) { /* no more receivers alive */
+    no_fail( mtx_unlock( &(port->s->mutex) ) );
+    luaL_error( L, "broken pipe" );
+  }
+  if( 0 != lua_cpcallr( port->s->L, copy_stack_top, L, 1 ) ) {
+    int res = lua_cpcallr( L, copy_stack_top, port->s->L, 1 );
+    lua_pop( port->s->L, 1 ); /* remove error object */
+    if( res != 0 )
+      lua_pushliteral( L, "unknown error" );
+    lua_error( L );
+  }
+  /* signal waiting receiver */
+  if( thrd_success !=
+      cnd_signal( &(port->s->data_copied) ) ) {
+    lua_pop( port->s->L, 1 );
+    no_fail( mtx_unlock( &(port->s->mutex) ) );
+    luaL_error( L, "signaling waiting thread failed" );
+  }
+  port->s->L = NULL;
+  no_fail( cnd_signal( &(port->s->waiting_receivers) ) );
+  no_fail( mtx_unlock( &(port->s->mutex) ) );
+  lua_pushboolean( L, 1 );
+  return 1;
 }
 
 
