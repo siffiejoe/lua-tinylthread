@@ -220,77 +220,117 @@ static int tinylthread_thunk( void* arg ) {
 }
 
 
-/* all API calls on toL are protected, on fromL not! */
+static int copy_primitive( lua_State* toL, lua_State* fromL, int i ) {
+  switch( lua_type( fromL, i ) ) {
+    case LUA_TNIL:
+      lua_pushnil( toL );
+      return 1;
+    case LUA_TBOOLEAN:
+      lua_pushboolean( toL, lua_toboolean( fromL, i ) );
+      return 1;
+    case LUA_TSTRING: {
+        size_t len = 0;
+        char const* s = lua_tolstring( fromL, i, &len );
+        lua_pushlstring( toL, s, len );
+      }
+      return 1;
+    case LUA_TNUMBER:
+      if( lua_isinteger( fromL, i ) )
+        lua_pushinteger( toL, lua_tointeger( fromL, i ) );
+      else
+        lua_pushnumber( toL, lua_tonumber( fromL, i ) );
+      return 1;
+  }
+  return 0;
+}
+
+static int copy_udata( lua_State* toL, lua_State* fromL, int i ) {
+  /* check that the userdata has `__name` and `__copy@tinylthread`
+   * metafields, and that there exists a corresponding metatable
+   * in the registry of the target Lua state */
+  int result = 0;
+  if( lua_type( fromL, i ) == LUA_TUSERDATA &&
+      !has_uservalue( fromL, i ) ) {
+    lua_getmetatable( fromL, i );
+    if( lua_istable( fromL, -1 ) ) {
+      tinylport_copyf copyf = 0;
+      lua_pushliteral( fromL, "__name" );
+      lua_rawget( fromL, -2 );
+      lua_pushliteral( fromL, "__copy@tinylthread" );
+      lua_rawget( fromL, -3 );
+      copyf = (tinylport_copyf)lua_tocfunction( fromL, -1 );
+      lua_pop( fromL, 1 ); /* copyf */
+      if( copyf != 0 && lua_type( fromL, -1 ) == LUA_TSTRING ) {
+        int equal = 0;
+        /* make sure __name really refers to this metatable */
+        lua_pushvalue( fromL, -1 );
+        lua_rawget( fromL, LUA_REGISTRYINDEX );
+        equal = lua_rawequal( fromL, -1, -3 );
+        lua_pop( fromL, 1 ); /* pop 2nd metatable */
+        if( equal ) {
+          size_t len = 0;
+          char const* name = lua_tolstring( fromL, -1, &len );
+          lua_pushlstring( toL, name, len );
+          lua_rawget( toL, LUA_REGISTRYINDEX );
+          if( lua_istable( toL, -1 ) ) {
+            int top = lua_gettop( toL );
+            if( copyf( lua_touserdata( fromL, i ), toL, top ) ) {
+              lua_insert( toL, top );
+              lua_settop( toL, top );
+              result = 1;
+            }
+          }
+        }
+      }
+      lua_pop( fromL, 1 ); /* pop name */
+    }
+    lua_pop( fromL, 1 ); /* pop metatable */
+  }
+  return result;
+}
+
+static int copy_table( lua_State* toL, lua_State* fromL, int i ) {
+  int top = lua_gettop( fromL );
+  if( lua_type( fromL, i ) == LUA_TTABLE ) {
+    if( !lua_getmetatable( fromL, i ) ) {
+      lua_newtable( toL );
+      lua_pushnil( fromL );
+      while( lua_next( fromL, i ) != 0 ) {
+        if( !copy_primitive( toL, fromL, top+1 ) ) {
+          lua_pop( fromL, 2 );
+          lua_pop( toL, 1 );
+          return 0;
+        }
+        if( !copy_primitive( toL, fromL, top+2 ) &&
+            !copy_udata( toL, fromL, top+2 ) ) {
+          lua_pop( fromL, 2 );
+          lua_pop( toL, 2 );
+          return 0;
+        }
+        lua_rawset( toL, -3 );
+        lua_pop( fromL, 1 );
+      }
+      return 1;
+    } else
+      lua_pop( fromL, 1 );
+  }
+  return 0;
+}
+
+
+/* all API calls on toL are protected, but all API calls on
+ * fromL are *unprotected* and could cause resource leaks if
+ * an unhandled error is thrown! */
 static void copy_to_thread( lua_State* toL, lua_State* fromL ) {
   int top = lua_gettop( fromL );
   int i = 1;
   luaL_checkstack( toL, top+LUA_MINSTACK, "copy_to_thread" );
   for( i = 1; i <= top; ++i ) {
-    switch( lua_type( fromL, i ) ) {
-      case LUA_TNIL:
-        lua_pushnil( toL );
-        break;
-      case LUA_TBOOLEAN:
-        lua_pushboolean( toL, lua_toboolean( fromL, i ) );
-        break;
-      case LUA_TSTRING: {
-          size_t len = 0;
-          char const* s = lua_tolstring( fromL, i, &len );
-          lua_pushlstring( toL, s, len );
-        }
-        break;
-      case LUA_TNUMBER:
-        if( lua_isinteger( fromL, i ) )
-          lua_pushinteger( toL, lua_tointeger( fromL, i ) );
-        else
-          lua_pushnumber( toL, lua_tonumber( fromL, i ) );
-        break;
-      case LUA_TUSERDATA:
-        /* check that the userdata has `__name` and `__tinylthread@copy`
-         * metafields, and that there exists a corresponding metatable
-         * in the registry of the target Lua state */
-        lua_getmetatable( fromL, i );
-        if( !has_uservalue( fromL, i ) && lua_istable( fromL, -1 ) ) {
-          tinylport_copyf copyf = 0;
-          lua_pushliteral( fromL, "__name" );
-          lua_rawget( fromL, -2 );
-          lua_pushliteral( fromL, "__tinylthread@copy" );
-          lua_rawget( fromL, -3 );
-          copyf = (tinylport_copyf)lua_tocfunction( fromL, -1 );
-          lua_pop( fromL, 1 ); /* copyf */
-          if( copyf != 0 && lua_type( fromL, -1 ) == LUA_TSTRING ) {
-            int equal = 0;
-            /* make sure __name really refers to this metatable */
-            lua_pushvalue( fromL, -1 );
-            lua_rawget( fromL, LUA_REGISTRYINDEX );
-            equal = lua_rawequal( fromL, -1, -3 );
-            lua_pop( fromL, 1 ); /* pop 2nd metatable */
-            if( equal ) {
-              size_t len = 0;
-              char const* name = lua_tolstring( fromL, -1, &len );
-              lua_pushlstring( toL, name, len );
-              lua_rawget( toL, LUA_REGISTRYINDEX );
-              if( lua_istable( toL, -1 ) ) {
-                int top = lua_gettop( toL );
-                if( copyf( lua_touserdata( fromL, i ), toL, top ) ) {
-                  lua_insert( toL, top );
-                  lua_settop( toL, top );
-                  lua_pop( fromL, 2 ); /* pop metatable and name */
-                  break; /* success! */
-                }
-              }
-            }
-          }
-          lua_pop( fromL, 1 ); /* pop name */
-        }
-        lua_pop( fromL, 1 ); /* pop metatable */
-        luaL_error( toL, "bad value #%d (unsupported type: 'userdata')",
-                    i );
-        break;
-      default:
-        luaL_error( toL, "bad value #%d (unsupported type: '%s')",
-                    i, luaL_typename( fromL, i ) );
-        break;
+    if( !copy_primitive( toL, fromL, i ) &&
+        !copy_udata( toL, fromL, i ) &&
+        !copy_table( toL, fromL, i ) ) {
+      luaL_error( toL, "bad value #%d (unsupported type: '%s')",
+                  i, luaL_typename( fromL, i ) );
     }
   }
 }
@@ -298,7 +338,7 @@ static void copy_to_thread( lua_State* toL, lua_State* fromL ) {
 
 /* all API calls on childL are protected, but all API calls on
  * parentL are *unprotected* and could cause resource leaks if
- * an unhandled exception is thrown! */
+ * an unhandled error is thrown! */
 static int prepare_thread_state( lua_State* childL ) {
   lua_State* parentL = lua_touserdata( childL, 1 );
   size_t len = 0;
@@ -343,7 +383,7 @@ static int prepare_thread_state( lua_State* childL ) {
 
 /* all API calls on L are protected, but all API calls on fromL are
  * *unprotected* and could cause resource leaks if an unhandled
- * exception is thrown! */
+ * error is thrown! */
 static int get_error_message( lua_State* L ) {
   lua_State* fromL = lua_touserdata( L, 1 );
 #define S "thread state initialization failed"
@@ -876,6 +916,40 @@ static int tinylthread_nointerrupt( lua_State* L ) {
 }
 
 
+typedef struct {
+  char const* metatable;
+  char const* type;
+} type_map;
+
+static int tinylthread_type( lua_State* L ) {
+  type_map const types[] = {
+    { TLT_THRD_NAME, "thread" },
+    { TLT_MTX_NAME, "mutex" },
+    { TLT_RPORT_NAME, "port" },
+    { TLT_WPORT_NAME, "port" },
+    { TLT_ITR_NAME, "interrupt" },
+    { NULL, NULL }
+  };
+  lua_settop( L, 1 );
+  if( lua_type( L, 1 ) == LUA_TUSERDATA ) {
+    size_t i;
+    lua_getmetatable( L, 1 );
+    if( lua_type( L, -1 ) == LUA_TTABLE ) {
+      for( i = 0; types[ i ].metatable != NULL; ++i ) {
+        luaL_getmetatable( L, types[ i ].metatable );
+        if( lua_rawequal( L, -1, -2 ) ) {
+          lua_pushstring( L, types[ i ].type );
+          return 1;
+        }
+        lua_pop( L, 1 );
+      }
+    }
+  }
+  lua_pushnil( L );
+  return 1;
+}
+
+
 
 static void create_api( lua_State* L ) {
   tinylthread_c_api_v1* api = lua_newuserdata( L, sizeof( *api ) );
@@ -922,6 +996,7 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
     { "pipe", tinylthread_new_pipe },
     { "sleep", tinylthread_sleep },
     { "nointerrupt", tinylthread_nointerrupt },
+    { "type", tinylthread_type },
     { NULL, NULL }
   };
   luaL_Reg const thread_methods[] = {
@@ -932,7 +1007,7 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
   };
   luaL_Reg const thread_metas[] = {
     { "__gc", tinylthread_gc },
-    { "__tinylthread@copy", (lua_CFunction)tinylthread_copy },
+    { "__copy@tinylthread", (lua_CFunction)tinylthread_copy },
     { NULL, NULL }
   };
   luaL_Reg const mutex_methods[] = {
@@ -943,7 +1018,7 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
   };
   luaL_Reg const mutex_metas[] = {
     { "__gc", tinylmutex_gc },
-    { "__tinylthread@copy", (lua_CFunction)tinylmutex_copy },
+    { "__copy@tinylthread", (lua_CFunction)tinylmutex_copy },
     { NULL, NULL }
   };
   luaL_Reg const rport_methods[] = {
@@ -956,12 +1031,12 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
   };
   luaL_Reg const port_metas[] = {
     { "__gc", tinylport_gc },
-    { "__tinylthread@copy", (lua_CFunction)tinylport_copy },
+    { "__copy@tinylthread", (lua_CFunction)tinylport_copy },
     { NULL, NULL }
   };
   luaL_Reg const itr_metas[] = {
     { "__tostring", tinylitr_tostring },
-    { "__tinylthread@copy", (lua_CFunction)tinylitr_copy },
+    { "__copy@tinylthread", (lua_CFunction)tinylitr_copy },
     { NULL, NULL }
   };
   /* create a struct containing function pointers to functions useful

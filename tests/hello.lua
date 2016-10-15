@@ -12,9 +12,14 @@ th1:join()
 
 print( "and now passing arguments + return values:" )
 local th2 = tlt.thread( [[
+  local tlt = require( "tinylthread" )
+  local t = ...
   print( "", "arguments:", ... )
+  for k,v in pairs( t ) do
+    print( "", "", t, k, v, tlt.type( v ) )
+  end
   return 2, true, nil, "b"
-]], 3, false, nil, "a" )
+]], { false, thread=th1 }, 3, false, nil, "a" )
 print( "", "results:", th2:join() )
 
 
