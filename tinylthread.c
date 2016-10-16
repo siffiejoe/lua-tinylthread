@@ -1190,10 +1190,17 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
 }
 
 
+
 #if !defined( __STDC_VERSION__ ) || \
     __STDC_VERSION__ < 201112L || \
     defined( __STDC_NO_THREADS__ ) || \
-    (defined( __APPLE__ ) && defined( __MACH__ ))
+    (defined( __APPLE__ ) && defined( __MACH__ )) || \
+    defined( __MINGW32__ )
+#  if defined( __MINGW32__ )
+/* Some small hacks necessary to build on MinGW: */
+WINBASEAPI DWORD WINAPI GetThreadId(HANDLE);
+#    define _ftime_s(_x) _ftime(_x)
+#  endif
 /* make building easier by including the source of the C11 threads
  * emulation library tinycthread */
 #  include <tinycthread.c>

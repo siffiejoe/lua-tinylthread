@@ -5,9 +5,10 @@
 #if defined( __STDC_VERSION__ ) && \
     __STDC_VERSION__ >= 201112L && \
     !defined( __STDC_NO_THREADS__ ) && \
-    !(defined( __APPLE__ ) && defined( __MACH__ ))
-/* use C11 threads; OSX is singled out, because apparently it is
- * not very good with standards and/or feature test macros! */
+    !(defined( __APPLE__ ) && defined( __MACH__ )) && \
+    !defined( __MINGW32__ )
+/* use C11 threads; OSX and MinGW apparently don't set the correct
+ * feature test macros! */
 #  include <threads.h>
 #  include <time.h>
 #else /* use C11 threads emulation tinycthreads */
