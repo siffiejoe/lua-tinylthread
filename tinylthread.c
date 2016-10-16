@@ -575,7 +575,7 @@ static int tinylthread_join( lua_State* L ) {
     luaL_error( L, "attempt to join an already joined thread" );
   if( thrd_success != thrd_join( thread->s->thread, &(data.status) ) )
     luaL_error( L, "joining thread failed" );
-  mtx_lock_or_throw( L, &(thread->s->mutex) );
+  no_fail( mtx_lock( &(thread->s->mutex) ) );
   data.L = thread->s->L;
   thread->s->L = NULL;
   no_fail( mtx_unlock( &(thread->s->mutex) ) );
