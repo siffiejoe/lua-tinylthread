@@ -1,3 +1,6 @@
 [submodule "tinycthread"]
 	path = tinycthread
 	url = https://github.com/tinycthread/tinycthread.git
+[submodule ".travis"]
+	path = .travis
+	url = https://github.com/siffiejoe/lua-travis

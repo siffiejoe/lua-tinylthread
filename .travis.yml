@@ -1,0 +1,42 @@
+language: c
+
+# Select container based VM (for os == linux).
+sudo: false
+
+# Use gcc as the C compiler (clang is also available).
+compiler: gcc
+
+# Specify operating systems to test on (linux and/or osx).
+os:
+  - linux
+  - osx
+
+# Environment variables for the build.
+env:
+  global:
+    - LUAROCKS=2.4.1
+  matrix:
+    - LUA=Lua-5.1.5
+    - LUA=Lua-5.2.4
+    - LUA=Lua-5.3.3
+
+# Only test changes to the master branch.
+branches:
+  only:
+    - master
+
+# Disable email notifications.
+notifications:
+  email: false
+
+# Install dependencies (Lua, Luarocks, ...).
+install:
+  - . .travis/install.sh
+
+# Build (and test?) your project.
+script:
+  - luarocks make CFLAGS="-Wall -O2 -fPIC"
+  - (cd tests && lua hello.lua)
+  - (cd tests && lua abonetwo.lua)
+  - (cd tests && lua count.lua)
+
