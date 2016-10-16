@@ -89,7 +89,7 @@ static void* get_udata_from_registry( lua_State* L, char const* name ) {
  * should be fatal (i.e. raise a Lua error or even abort). */
 static void mtx_lock_or_throw( lua_State* L, mtx_t* m ) {
   if( thrd_success != mtx_lock( m ) )
-    luaL_error( L, "mutex locking failed" );
+    luaL_error( L, "locking mutex failed" );
 }
 
 #define no_fail( _call ) \
@@ -103,14 +103,14 @@ static void mtx_lock_or_throw( lua_State* L, mtx_t* m ) {
 /* helper functions for managing the reference count of shared
  * objects */
 static void increment_ref_count( lua_State* L, tinylheader* ref ) {
-  mtx_lock_or_throw( L, &(ref->mtx) );
+  no_fail( mtx_lock( &(ref->mtx) ) );
   ref->cnt++;
   no_fail( mtx_unlock( &(ref->mtx) ) );
 }
 
 static size_t decrement_ref_count( lua_State* L, tinylheader* ref ) {
   size_t newcnt = 0;
-  mtx_lock_or_throw( L, &(ref->mtx) );
+  no_fail( mtx_lock( &(ref->mtx) ) );
   newcnt = --(ref->cnt);
   no_fail( mtx_unlock( &(ref->mtx) ) );
   return newcnt;
@@ -152,8 +152,8 @@ static int is_interrupted( tinylthread* thread, int* disabled ) {
   int dummy = 0;
   if( !disabled )
     disabled = &dummy;
-  if( thread != NULL &&
-      thrd_success == mtx_lock( &(thread->s->mutex) ) ) {
+  if( thread != NULL ) {
+    no_fail( mtx_lock( &(thread->s->mutex) ) );
     *disabled |= thread->s->ignore_interrupt;
     if( thread->s->is_interrupted ) {
       if( !*disabled )
@@ -173,8 +173,8 @@ static void throw_interrupt( lua_State* L ) {
 
 static void set_block( tinylthread* thread, tinylheader* h,
                        cnd_t* c, mtx_t* m ) {
-  if( thread != NULL &&
-      thrd_success == mtx_lock( &(thread->s->mutex) ) ) {
+  if( thread != NULL ) {
+    no_fail( mtx_lock( &(thread->s->mutex) ) );
     thread->s->block.header = h;
     thread->s->block.condition = c;
     thread->s->block.mutex = m;
@@ -186,7 +186,7 @@ static void set_block( tinylthread* thread, tinylheader* h,
 static int cleanup_thread( lua_State* L ) {
   int* memory_problem = lua_touserdata( L, 1 );
   tinylthread* thread = get_udata_from_registry( L, TLT_THISTHREAD );
-  int is_detached = 0;
+  int is_detached = 1;
   lua_settop( L, 0 );
   if( thread != NULL &&
       thrd_success == mtx_lock( &(thread->s->mutex) ) ) {
@@ -459,7 +459,7 @@ static int tinylthread_new_thread( lua_State* L ) {
   if( thrd_success != mtx_lock( &(thread->s->mutex) ) ) {
     thread->s->L = NULL;
     lua_close( tempL );
-    luaL_error( L, "mutex locking failed" );
+    luaL_error( L, "locking mutex failed" );
   }
   if( thrd_success !=
       thrd_create( &(thread->s->thread), thunk, thread->s->L ) ) {
@@ -516,7 +516,7 @@ static int tinylthread_detach( lua_State* L ) {
   int is_joined = 0;
   int status = 0;
   if( !thread->is_parent )
-    luaL_error( L, "detach request from unrelated thread" );
+    luaL_error( L, "detach attempt from non-parent thread" );
   mtx_lock_or_throw( L, &(thread->s->mutex) );
   is_detached = thread->s->is_detached;
   is_joined = thread->s->L == NULL;
@@ -535,7 +535,7 @@ static int tinylthread_detach( lua_State* L ) {
     return 1;
   } else {
     lua_pushnil( L );
-    lua_pushliteral( L, "thread detaching failed" );
+    lua_pushliteral( L, "detaching thread failed" );
     return 2;
   }
 }
@@ -564,7 +564,7 @@ static int tinylthread_join( lua_State* L ) {
   int is_joined = 0;
   join_data data = { 0, NULL };
   if( !thread->is_parent )
-    luaL_error( L, "join request from unrelated thread" );
+    luaL_error( L, "join attempt from non-parent thread" );
   mtx_lock_or_throw( L, &(thread->s->mutex) );
   is_detached = thread->s->is_detached;
   is_joined = thread->s->L == NULL;
@@ -574,7 +574,7 @@ static int tinylthread_join( lua_State* L ) {
   if( is_joined )
     luaL_error( L, "attempt to join an already joined thread" );
   if( thrd_success != thrd_join( thread->s->thread, &(data.status) ) )
-    luaL_error( L, "thread joining failed" );
+    luaL_error( L, "joining thread failed" );
   mtx_lock_or_throw( L, &(thread->s->mutex) );
   data.L = thread->s->L;
   thread->s->L = NULL;
@@ -592,7 +592,7 @@ static int tinylthread_join( lua_State* L ) {
 static int tinylthread_interrupt( lua_State* L ) {
   tinylthread* thread = check_thread( L, 1 );
   tinylblock block;
-  mtx_lock_or_throw( L, &(thread->s->mutex) );
+  no_fail( mtx_lock( &(thread->s->mutex) ) );
   thread->s->is_interrupted = 1;
   block = thread->s->block;
   if( block.header ) {
@@ -665,7 +665,8 @@ static int tinylmutex_copy( void* p, lua_State* L, int midx ) {
 static int tinylmutex_gc( lua_State* L ) {
   tinylmutex* mutex = lua_touserdata( L, 1 );
   if( mutex->s ) {
-    if( mutex->is_owner && mtx_lock( &(mutex->s->mutex) ) ) {
+    if( mutex->is_owner ) {
+      no_fail( mtx_lock( &(mutex->s->mutex) ) );
       mutex->s->count = 0;
       no_fail( cnd_signal( &(mutex->s->unlocked) ) );
       no_fail( mtx_unlock( &(mutex->s->mutex) ) );
@@ -696,7 +697,7 @@ static int tinylmutex_lock( lua_State* L ) {
         cnd_wait( &(mutex->s->unlocked), &(mutex->s->mutex) ) ) {
       set_block( thread, NULL, NULL, NULL );
       no_fail( mtx_unlock( &(mutex->s->mutex) ) );
-      luaL_error( L, "waiting on condition variable failed" );
+      luaL_error( L, "waiting for mutex failed" );
     }
     set_block( thread, NULL, NULL, NULL );
   }
@@ -736,13 +737,11 @@ static int tinylmutex_unlock( lua_State* L ) {
   tinylthread* thread = get_udata_from_registry( L, TLT_THISTHREAD );
   int locked = 0;
   int owner = mutex->is_owner;
-  mtx_lock_or_throw( L, &(mutex->s->mutex) );
+  no_fail( mtx_lock( &(mutex->s->mutex) ) );
   locked = mutex->s->count > 0;
-  if( locked && owner && --(mutex->s->count) == 0 &&
-      ((mutex->is_owner = 0), 1) && /* assignment + comma operator! */
-      thrd_success != cnd_signal( &(mutex->s->unlocked) ) ) {
-    no_fail( mtx_unlock( &(mutex->s->mutex) ) );
-    luaL_error( L, "signaling waiting threads failed" );
+  if( locked && owner && --(mutex->s->count) == 0 ) {
+    mutex->is_owner = 0;
+    no_fail( cnd_signal( &(mutex->s->unlocked) ) );
   }
   no_fail( mtx_unlock( &(mutex->s->mutex) ) );
   if( is_interrupted( thread, NULL ) )
@@ -838,16 +837,17 @@ static int tinylport_copy( void* p, lua_State* L, int midx ) {
 static int tinylport_gc( lua_State* L ) {
   tinylport* port = lua_touserdata( L, 1 );
   if( port->s ) {
-    if( thrd_success == mtx_lock( &(port->s->mutex) ) ) {
-      if( port->is_reader ) {
-        if( 0 == --(port->s->rports) )
-          no_fail( cnd_broadcast( &(port->s->waiting_senders) ) );
-      } else {
-        if( 0 == --(port->s->wports) )
-          no_fail( cnd_broadcast( &(port->s->waiting_receivers) ) );
+    no_fail( mtx_lock( &(port->s->mutex) ) );
+    if( port->is_reader ) {
+      if( 0 == --(port->s->rports) )
+        no_fail( cnd_broadcast( &(port->s->waiting_senders) ) );
+    } else {
+      if( 0 == --(port->s->wports) ) {
+        no_fail( cnd_broadcast( &(port->s->data_copied) ) );
+        no_fail( cnd_broadcast( &(port->s->waiting_receivers) ) );
       }
-      no_fail( mtx_unlock( &(port->s->mutex) ) );
     }
+    no_fail( mtx_unlock( &(port->s->mutex) ) );
     if( 0 == decrement_ref_count( L, &(port->s->ref) ) ) {
       mtx_destroy( &(port->s->ref.mtx) );
       mtx_destroy( &(port->s->mutex) );
@@ -879,7 +879,7 @@ static int tinylport_read( lua_State* L ) {
         cnd_wait( &(port->s->waiting_receivers), &(port->s->mutex) ) ) {
       set_block( thread, NULL, NULL, NULL );
       no_fail( mtx_unlock( &(port->s->mutex) ) );
-      luaL_error( L, "waiting on condition variable failed" );
+      luaL_error( L, "waiting for port access failed" );
     }
     set_block( thread, NULL, NULL, NULL );
   }
@@ -895,8 +895,9 @@ static int tinylport_read( lua_State* L ) {
   if( thrd_success !=
       cnd_signal( &(port->s->waiting_senders) ) ) {
     port->s->L = NULL;
+    no_fail( cnd_signal( &(port->s->waiting_receivers) ) );
     no_fail( mtx_unlock( &(port->s->mutex) ) );
-    luaL_error( L, "signaling waiting threads failed" );
+    luaL_error( L, "waking up sender thread failed" );
   }
   while( !(itr=is_interrupted( thread, &disabled )) &&
          port->s->L == L &&
@@ -909,7 +910,7 @@ static int tinylport_read( lua_State* L ) {
       port->s->L = NULL;
       no_fail( cnd_signal( &(port->s->waiting_receivers) ) );
       no_fail( mtx_unlock( &(port->s->mutex) ) );
-      luaL_error( L, "waiting on condition variable failed" );
+      luaL_error( L, "waiting for data transfer failed" );
     }
     set_block( thread, NULL, NULL, NULL );
   }
@@ -947,7 +948,7 @@ static int tinylport_write( lua_State* L ) {
         cnd_wait( &(port->s->waiting_senders), &(port->s->mutex) ) ) {
       set_block( thread, NULL, NULL, NULL );
       no_fail( mtx_unlock( &(port->s->mutex) ) );
-      luaL_error( L, "waiting on condition variable failed" );
+      luaL_error( L, "waiting for a receiver thread failed" );
     }
     set_block( thread, NULL, NULL, NULL );
   }
@@ -971,7 +972,7 @@ static int tinylport_write( lua_State* L ) {
       cnd_signal( &(port->s->data_copied) ) ) {
     lua_pop( port->s->L, 1 );
     no_fail( mtx_unlock( &(port->s->mutex) ) );
-    luaL_error( L, "signaling waiting thread failed" );
+    luaL_error( L, "waking up receiver thread failed" );
   }
   port->s->L = NULL;
   no_fail( cnd_signal( &(port->s->waiting_receivers) ) );
@@ -1032,7 +1033,7 @@ static int tinylthread_sleep( lua_State* L ) {
 static int tinylthread_nointerrupt( lua_State* L ) {
   tinylthread* thread = get_udata_from_registry( L, TLT_THISTHREAD );
   if( thread != NULL ) {
-    mtx_lock_or_throw( L, &(thread->s->mutex) );
+    no_fail( mtx_lock( &(thread->s->mutex) ) );
     thread->s->ignore_interrupt = 1;
     no_fail( mtx_unlock( &(thread->s->mutex) ) );
   }
