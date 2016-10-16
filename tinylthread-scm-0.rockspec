@@ -6,7 +6,7 @@ source = {
 description = {
   summary = "Tiny and portable multi-threading module for Lua.",
   homepage = "https://github.com/siffiejoe/lua-tinylthread/",
-  license = "MIT"
+  license = "MIT+ZLIB"
 }
 
 supported_platforms = { "linux", "windows", "macosx" }
@@ -30,7 +30,7 @@ build = {
     linux = {
       modules = {
         tinylthread = {
-          libraries = { "pthread" },
+          libraries = { "pthread", "rt" },
         },
       },
     },
