@@ -1075,6 +1075,32 @@ static int tinylthread_type( lua_State* L ) {
 }
 
 
+#define TOSTRING_HELPER( _x ) #_x
+#define TOSTRING( _x ) TOSTRING_HELPER( _x )
+
+static int tinylthread_version( lua_State* L ) {
+  lua_pushliteral( L, "tinylthread v"
+      TOSTRING( TINYLTHREAD_VERSION_MAJOR ) "."
+      TOSTRING( TINYLTHREAD_VERSION_MINOR ) "."
+      TOSTRING( TINYLTHREAD_VERSION_PATCH )
+#if defined( TINYCTHREAD_VERSION_MAJOR )
+      " (using tinycthread v"
+      TOSTRING( TINYCTHREAD_VERSION_MAJOR ) "."
+      TOSTRING( TINYCTHREAD_VERSION_MINOR ) ")"
+#else
+      " (using C11 threads)"
+#endif
+      );
+  lua_pushinteger( L, TINYLTHREAD_VERSION_MAJOR * 10000
+                    + TINYLTHREAD_VERSION_MINOR * 100
+                    + TINYLTHREAD_VERSION_PATCH );
+  return 2;
+}
+
+#undef TOSTRING_HELPER
+#undef TOSTRING
+
+
 
 static void create_api( lua_State* L ) {
   tinylthread_c_api_v1* api = lua_newuserdata( L, sizeof( *api ) );
@@ -1122,6 +1148,7 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
     { "sleep", tinylthread_sleep },
     { "nointerrupt", tinylthread_nointerrupt },
     { "type", tinylthread_type },
+    { "version", tinylthread_version },
     { NULL, NULL }
   };
   luaL_Reg const thread_methods[] = {
@@ -1193,9 +1220,7 @@ TINYLTHREAD_API int luaopen_tinylthread( lua_State* L ) {
 
 #if !defined( __STDC_VERSION__ ) || \
     __STDC_VERSION__ < 201112L || \
-    defined( __STDC_NO_THREADS__ ) || \
-    (defined( __APPLE__ ) && defined( __MACH__ )) || \
-    defined( __MINGW32__ )
+    defined( __STDC_NO_THREADS__ )
 #  if defined( __MINGW32__ )
 /* Some small hacks necessary to build on MinGW: */
 WINBASEAPI DWORD WINAPI GetThreadId(HANDLE);

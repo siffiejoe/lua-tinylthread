@@ -2,13 +2,17 @@
 #define TINYLTHREAD_H_
 
 
+#if !defined( __STDC_NO_THREADS__ ) && \
+    ((defined( __APPLE__ ) && defined( __MACH__ )) || \
+     defined( __MINGW32__ ))
+/* OSX and MinGW apparently don't set the correct feature test macros!
+ */
+#  define __STDC_NO_THREADS__
+#endif
+
 #if defined( __STDC_VERSION__ ) && \
     __STDC_VERSION__ >= 201112L && \
-    !defined( __STDC_NO_THREADS__ ) && \
-    !(defined( __APPLE__ ) && defined( __MACH__ )) && \
-    !defined( __MINGW32__ )
-/* use C11 threads; OSX and MinGW apparently don't set the correct
- * feature test macros! */
+    !defined( __STDC_NO_THREADS__ ) /* use C11 threads */
 #  include <threads.h>
 #  include <time.h>
 #else /* use C11 threads emulation tinycthreads */
@@ -29,6 +33,10 @@
 #  endif
 #endif
 
+/* module version */
+#define TINYLTHREAD_VERSION_MAJOR 0
+#define TINYLTHREAD_VERSION_MINOR 0
+#define TINYLTHREAD_VERSION_PATCH 1
 
 /* metatable names */
 #define TLT_THRD_NAME   "tinylthread.thread"

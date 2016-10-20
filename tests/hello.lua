@@ -3,7 +3,7 @@
 local tlt = require( "tinylthread" )
 
 
-print( "hello from main thread" )
+print( tlt.version() )
 local th1 = tlt.thread[[
   print( "", "hello from child thread" )
 ]]
